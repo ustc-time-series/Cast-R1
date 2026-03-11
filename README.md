@@ -61,7 +61,29 @@ conda activate cast-r1
 pip install -r requirements.txt
 ```
 
-### 3. Prepare Data
+### 3. Prepare Tool Model
+
+Download the Chronos-2 model and Train PatchTST and iTransformer using the repository:[TSLib](https://github.com/thuml/Time-Series-Library)
+
+After training, place the checkpoints into:
+```bash
+recipe/time_series_forecast/models/
+
+# run model_server
+sh recipe/time_series_forecast/start_model_server.sh
+```
+
+Example structure:
+```bash
+recipe/time_series_forecast/models/
+├── chronos-2/
+├── PatchTST/
+│   └── checkpoint.pth
+└── iTransformer/
+    └── checkpoint.pth
+```
+
+### 4. Prepare Data
 
 Cast-R1 is evaluated on diverse real-world benchmarks:
 
@@ -77,7 +99,7 @@ mkdir -p dataset
 # Download datasets to ./dataset/
 ```
 
-### 4. Run Forecasting
+### 5. Run Forecasting
 
 ```bash
 # Example: run long-term forecasting on ETT
