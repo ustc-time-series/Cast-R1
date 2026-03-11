@@ -133,3 +133,14 @@ Cast-R1-TS/
 ## 📜 License
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
+## Citation
+
+```bibtex
+@article{tao2026cast,
+  title={Cast-R1: Learning Tool-Augmented Sequential Decision Policies for Time Series Forecasting},
+  author={Tao, Xiaoyu and Cheng, Mingyue and Jiang, Chuang and Gao, Tian and Zhang, Huanjian and Liu, Yaguo},
+  journal={arXiv preprint arXiv:2602.13802},
+  year={2026}
+}
+```
