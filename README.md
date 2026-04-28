@@ -16,7 +16,7 @@
 Cast-R1 is a novel framework that reformulates **Time Series Forecasting** as an **evidence-driven sequential decision-making process**. It combines memory-based state management with tool-augmented reasoning and a two-stage learning strategy (supervised fine-tuning + multi-turn reinforcement learning) to enable adaptive evidence gathering, reasoning-based prediction, and iterative forecast refinement.
 
 > 📝 "Cast-R1: Learning Tool-Augmented Sequential Decision Policies for Time Series Forecasting"  
-> **Preprint** | [📄 Paper]()
+> **Preprint** | [📄 Paper](https://arxiv.org/pdf/2602.13802)
 
 ---
 
