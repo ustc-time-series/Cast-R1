@@ -19,6 +19,12 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 
+LONG_FORECAST_DATASETS = {"ETTH1", "ETTH2", "ETTM1", "ETTM2", "WIND"}
+SHORT_FORECAST_DATASETS = {"NP", "PJM", "BE", "DE", "FR"}
+LONG_FORECAST_LENGTHS = (96, 96)
+SHORT_FORECAST_LENGTHS = (168, 24)
+
+
 def _parse_env_int(name: str) -> Optional[int]:
     value = os.environ.get(name)
     if value is None:
@@ -66,3 +72,28 @@ def get_default_lengths() -> Tuple[int, int]:
         horizon = 96
 
     return lookback, horizon
+
+
+def normalize_dataset_name(dataset_name: Optional[str]) -> Optional[str]:
+    if dataset_name is None:
+        return None
+    normalized = str(dataset_name).strip()
+    if not normalized:
+        return None
+    return normalized.upper()
+
+
+def get_dataset_lengths(dataset_name: Optional[str]) -> Tuple[int, int]:
+    """
+    Return the task-specific lookback/forecast lengths for known datasets.
+
+    ETT and Wind are long-term forecasting tasks (96/96). The power-market
+    datasets are short-term forecasting tasks (168/24). Unknown datasets fall
+    back to the runtime default so tests and ad-hoc experiments keep working.
+    """
+    normalized = normalize_dataset_name(dataset_name)
+    if normalized in LONG_FORECAST_DATASETS:
+        return LONG_FORECAST_LENGTHS
+    if normalized in SHORT_FORECAST_DATASETS:
+        return SHORT_FORECAST_LENGTHS
+    return get_default_lengths()

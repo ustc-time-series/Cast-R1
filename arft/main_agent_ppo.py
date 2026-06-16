@@ -37,20 +37,27 @@ from arft.ray_agent_trainer import RayAgentTrainer
 
 class ArftSearchPathPlugin(SearchPathPlugin):
     """
-    Hydra search path plugin allowing arft config to override verl defaults.
-    Search order (priority high to low): arft/config, verl/verl/trainer/config.
+    Hydra 搜索路径插件，允许 arft 的配置覆盖 verl 的默认配置。
+    
+    搜索顺序（优先级从高到低）：
+    1. arft/config - arft 自定义配置
+    2. verl/verl/trainer/config - verl 默认配置
     """
     def manipulate_search_path(self, search_path):
+        # 获取项目根目录
         arft_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(arft_dir)
         
+        # 添加 verl 配置路径作为基础配置（低优先级）
         verl_config_path = os.path.join(project_root, "verl", "verl", "trainer", "config")
         search_path.append(provider="verl", path=f"file://{verl_config_path}")
         
+        # 添加 arft 配置路径作为覆盖配置（高优先级）
         arft_config_path = os.path.join(arft_dir, "config")
         search_path.append(provider="arft", path=f"file://{arft_config_path}")
 
 
+# 注册搜索路径插件
 Plugins.instance().register(ArftSearchPathPlugin)
 
 
@@ -293,10 +300,12 @@ class TaskRunner:
         from omegaconf import OmegaConf
 
         from verl.utils.fs import copy_to_local
+        from verl.utils.vllm_tokenizer_patch import apply_vllm_tokenizer_patches
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        apply_vllm_tokenizer_patches()
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)

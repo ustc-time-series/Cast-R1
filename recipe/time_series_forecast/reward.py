@@ -6,6 +6,20 @@ import torch.nn as nn
 from typing import List, Optional, Tuple
 
 
+RAW_BASELINE_METRICS: dict[str, tuple[float, float]] = {
+    "ETTH1": (2.639, 1.157),
+    "ETTH2": (32.922, 4.606),
+    "ETTM1": (0.381, 0.486),
+    "ETTM2": (28.272, 3.705),
+    "WIND": (305.786, 12.031),
+    "NP": (19.932, 2.34),
+    "PJM": (20.642, 3.255),
+    "BE": (134.886, 8.414),
+    "DE": (175.534, 11.571),
+    "FR": (39.926, 4.878),
+}
+
+
 class moving_avg(nn.Module):
     def __init__(self, kernel_size, stride):
         super(moving_avg, self).__init__()
@@ -55,6 +69,114 @@ def decompose(x: List[float]) -> Tuple[np.ndarray, np.ndarray]:
 def mean_squared_error(y_true: List[float], y_pred: List[float]) -> float:
     """Calculate mean squared error."""
     return float(np.mean((np.array(y_true) - np.array(y_pred)) ** 2))
+
+
+def _normalize_dataset_name(dataset_name: Optional[str]) -> Optional[str]:
+    if dataset_name is None:
+        return None
+    normalized = str(dataset_name).strip().upper()
+    if normalized == "WIND":
+        return "WIND"
+    return normalized or None
+
+
+def compute_raw_mse_mae(solution_str: str, ground_truth: str) -> tuple[float, float]:
+    """Compute raw-scale MSE/MAE using the full ground-truth horizon as the gate."""
+    gt_values = extract_ground_truth_values(ground_truth)
+    pred_values = extract_values_from_time_series_string(solution_str)
+
+    if not gt_values or len(pred_values) < len(gt_values):
+        return float("nan"), float("nan")
+
+    gt_arr = np.array(gt_values, dtype=float)
+    pred_arr = np.array(pred_values[: len(gt_values)], dtype=float)
+    if not np.all(np.isfinite(gt_arr)) or not np.all(np.isfinite(pred_arr)):
+        return float("nan"), float("nan")
+
+    diff = pred_arr - gt_arr
+    return float(np.mean(diff**2)), float(np.mean(np.abs(diff)))
+
+
+def _metric_margin(metric: float, target: float) -> float:
+    if not np.isfinite(metric) or not np.isfinite(target) or target <= 0:
+        return 0.0
+    return float((target - metric) / target)
+
+
+def _same_prediction_values(left: str, right: str) -> bool:
+    left_values = extract_values_from_time_series_string(left)
+    right_values = extract_values_from_time_series_string(right)
+    if not left_values or len(left_values) != len(right_values):
+        return False
+    left_arr = np.array(left_values, dtype=float)
+    right_arr = np.array(right_values, dtype=float)
+    if not np.all(np.isfinite(left_arr)) or not np.all(np.isfinite(right_arr)):
+        return False
+    return bool(np.allclose(left_arr, right_arr, rtol=1e-6, atol=1e-6))
+
+
+def compute_raw_relative_score(
+    data_source: str,
+    solution_str: str,
+    ground_truth: str,
+    extra_info: Optional[dict] = None,
+) -> float:
+    """
+    Reward raw-scale improvement toward the published baseline and tool forecast.
+
+    The old normalized/shape reward can give high scores to copied tool forecasts
+    whose raw MSE/MAE are still worse than the baseline. This score uses raw MSE/MAE
+    as the main objective and makes exact tool copies non-positive.
+    """
+    if solution_str is None:
+        return -1.0
+
+    format_score = compute_format_score(solution_str)
+    if format_score < 0:
+        return format_score
+
+    mse, mae = compute_raw_mse_mae(solution_str, ground_truth)
+    if not np.isfinite(mse) or not np.isfinite(mae):
+        return -0.5
+
+    extra_info = extra_info or {}
+    dataset_name = _normalize_dataset_name(extra_info.get("dataset_name") or data_source)
+    targets: list[tuple[float, float]] = []
+
+    baseline = RAW_BASELINE_METRICS.get(dataset_name or "")
+    if baseline:
+        targets.append(baseline)
+
+    reference_prediction = extra_info.get("reference_prediction")
+    ref_mse = ref_mae = float("nan")
+    if reference_prediction:
+        ref_mse, ref_mae = compute_raw_mse_mae(str(reference_prediction), ground_truth)
+        if np.isfinite(ref_mse) and np.isfinite(ref_mae):
+            targets.append((ref_mse, ref_mae))
+
+    if targets:
+        target_mse = min(target[0] for target in targets)
+        target_mae = min(target[1] for target in targets)
+        score = 0.5 * _metric_margin(mse, target_mse) + 0.5 * _metric_margin(mae, target_mae)
+    else:
+        # Unknown datasets still get a monotonic raw-MSE signal, but no positive
+        # baseline margin is invented.
+        score = compute_mse_score(solution_str, ground_truth) - 0.5
+
+    if reference_prediction and np.isfinite(ref_mse) and np.isfinite(ref_mae):
+        delta = 0.5 * _metric_margin(mse, ref_mse) + 0.5 * _metric_margin(mae, ref_mae)
+        score += 0.5 * float(np.clip(delta, -1.0, 1.0))
+        if _same_prediction_values(solution_str, str(reference_prediction)):
+            if np.isclose(ref_mse, 0.0) and np.isclose(ref_mae, 0.0):
+                score = max(score, 0.0)
+            else:
+                # Exact reference copies are only acceptable when the reference is already perfect.
+                # Otherwise push the policy away from the "wrap tool output in <answer>" local optimum.
+                ref_error_scale = float(np.clip((ref_mse + ref_mae) / (ref_mse + ref_mae + 1.0), 0.0, 1.0))
+                copy_penalty = 0.1 + 0.2 * ref_error_scale
+                score = min(score, -copy_penalty)
+
+    return float(np.clip(score, -1.0, 1.0))
 
 
 def mean_squared_error_season_trend(y_true: List[float], y_pred: List[float]) -> Tuple[Optional[float], Optional[float]]:

@@ -1,10 +1,13 @@
-# Override agent config only; other configs inherit from verl defaults
+# 只覆盖需要修改的配置项 - agent 部分
+# 其他配置从 verl 的默认配置继承
 
+# 使用 async 模式
 mode: async
 
-# [Experimental] agent flow based rollout configs
+# [Experimental] agent flow based rollout configs (覆盖 verl 的 AgentLoopConfig)
 agent:
 
+  # 使用 arft 的 AgentFlowConfig 替代 verl 的 AgentLoopConfig
   _target_: arft.config.AgentFlowConfig
 
   # Number of agent flow workers

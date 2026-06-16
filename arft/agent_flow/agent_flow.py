@@ -235,6 +235,21 @@ class AgentFlowBase(ABC):
         
         return reward_score, reward_extra_info
 
+    def _truncate_prompt_ids_for_rollout(self, prompt_ids: list[int]) -> list[int]:
+        """Keep prompt ids within rollout.prompt_length by preserving the most recent tokens."""
+        config = getattr(self, "config", None)
+        rollout_cfg = getattr(getattr(config, "actor_rollout_ref", None), "rollout", None)
+        max_prompt_length = getattr(rollout_cfg, "prompt_length", None)
+        if max_prompt_length is None or len(prompt_ids) <= max_prompt_length:
+            return prompt_ids
+
+        logger.warning(
+            "Prompt length %s exceeds rollout.prompt_length=%s; truncating left context",
+            len(prompt_ids),
+            max_prompt_length,
+        )
+        return list(prompt_ids[-max_prompt_length:])
+
     async def _postprocess(self, step: AgentFlowStep, **kwargs) -> _InternalAgentFlowStep:
         step.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
@@ -482,6 +497,12 @@ class AgentFlowWorkerBase:
             trace_config.get("max_samples_per_step_per_worker", None),
         )
 
+    def _to_object_vector(self, values) -> np.ndarray:
+        """Force nested python objects into a 1D object array for safe concat across workers."""
+        arr = np.empty(len(values), dtype=object)
+        arr[:] = values
+        return arr
+
     @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -510,6 +531,8 @@ class AgentFlowWorkerBase:
             top_p=config.top_p,
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
+            stop=["</answer>"],
+            include_stop_str_in_output=True,
         )
 
         # override sampling params for validation
@@ -688,10 +711,11 @@ class AgentFlowWorkerBase:
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         if any(mmi is not None for mmi in multi_modal_inputs):
-            non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs, dtype=object)
+            non_tensor_batch["multi_modal_inputs"] = self._to_object_vector(multi_modal_inputs)
 
         metrics = [input.metrics.model_dump() for input in inputs]
 
+        # TODO: 验证 metrics 格式
         # Add num_steps to each metric dict for proper aggregation during concat
         for i, metric in enumerate(metrics):
             metric["num_steps"] = num_steps[i]
@@ -710,7 +734,7 @@ class AgentFlowWorkerBase:
             for input_item in inputs:
                 for step in input_item.steps:
                     temp_list.append(step.extra_fields.get(key))
-            extra_fields[key] = np.array(temp_list, dtype=object)
+            extra_fields[key] = self._to_object_vector(temp_list)
 
         non_tensor_batch.update(extra_fields)
         return DataProto(
@@ -881,10 +905,11 @@ class AgentFlowManager:
 
         split_size = (len(prompts) - 1) // len(self.agent_flow_workers) + 1
         chunks = prompts.split(split_size)
+        active_workers = self.agent_flow_workers[: len(chunks)]
         outputs = ray.get(
             [
                 worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_flow_workers, chunks, strict=True)
+                for worker, chunk in zip(active_workers, chunks, strict=True)
             ]
         )
 

@@ -12,10 +12,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-TIMESERIES_SYSTEM_PROMPT = """You are a time series forecasting agent. This is a MULTI-TURN interaction.
+DEFAULT_ALLOWED_PREDICT_MODELS = ["patchtst", "itransformer", "arima", "chronos2"]
+PREDICT_MODEL_DESCRIPTIONS = {
+    "patchtst": "Strong local patterns, long-range dependencies",
+    "itransformer": "Cross-channel correlations",
+    "arima": "Clear trends, stable seasonality",
+    "chronos2": "Default. Highly irregular data",
+}
 
-##Dataset Description
-This dataset consists of hourly electricity market prices used for Electricity Price Forecasting (EPF). The time series exhibits strong daily and weekly seasonality, high volatility, and frequent price spikes. The data is non-stationary and heavy-tailed, with abrupt regime changes driven by demand, supply, and market mechanisms. The forecasting task is to predict future electricity prices over short to medium horizons based on historical price patterns.
+
+def normalize_predict_model_policy(
+    preferred_predict_model: str | None = None,
+    allowed_predict_model_names: list[str] | tuple[str, ...] | None = None,
+) -> tuple[str, list[str]]:
+    normalized: list[str] = []
+    configured = allowed_predict_model_names or DEFAULT_ALLOWED_PREDICT_MODELS
+    for model_name in configured:
+        if not isinstance(model_name, str):
+            continue
+        candidate = model_name.strip().lower()
+        if candidate in PREDICT_MODEL_DESCRIPTIONS and candidate not in normalized:
+            normalized.append(candidate)
+
+    if not normalized:
+        normalized = list(DEFAULT_ALLOWED_PREDICT_MODELS)
+
+    preferred = (
+        preferred_predict_model.strip().lower()
+        if isinstance(preferred_predict_model, str) and preferred_predict_model.strip()
+        else None
+    )
+    if preferred not in normalized:
+        preferred = normalized[0]
+
+    return preferred, normalized
+
+
+def build_timeseries_system_prompt(
+    preferred_predict_model: str | None = None,
+    allowed_predict_model_names: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    preferred, allowed = normalize_predict_model_policy(
+        preferred_predict_model=preferred_predict_model,
+        allowed_predict_model_names=allowed_predict_model_names,
+    )
+    if len(allowed) == 1:
+        turn2_instruction = (
+            f"After seeing feature results in \"Analysis History\", call `predict_time_series` "
+            f"with model_name '{preferred}'. Prefer '{preferred}'; it is the only allowed model."
+        )
+    else:
+        model_lines = "\n".join(
+            f"- '{model_name}': {PREDICT_MODEL_DESCRIPTIONS[model_name]}" for model_name in allowed
+        )
+        turn2_instruction = (
+            f"After seeing feature results in \"Analysis History\", call `predict_time_series` "
+            f"with chosen model (prefer '{preferred}' unless features strongly suggest otherwise):\n"
+            f"{model_lines}"
+        )
+
+    return f"""You are a time series forecasting agent. This is a MULTI-TURN interaction.
 
 ## Workflow (MUST follow this order across turns)
 
@@ -28,19 +84,19 @@ Call one or more feature extraction tools. Do NOT call predict_time_series yet.
 - `extract_event_summary`: segment patterns (rise/fall/oscillation)
 
 **Turn 2 - Prediction**:
-After seeing feature results in "Analysis History", call `predict_time_series` with the chosen model:
-- 'patchtst': Local temporal patterns + long-range dependency
-- 'itransformer': Strong cross-channel dependency
-- 'arima': Linear trend + stable seasonality
-- 'chronos2': Irregular or noisy patterns
+{turn2_instruction}
 
 **Turn 3 - Final Output**:
-Reflect on feature analysis and model predictions, refine unreasonable results, and output the final forecast.
+Treat the Model Predictions as a reference forecast, not ground truth. Do not treat the reference
+forecast as the final answer automatically. Check it against the extracted evidence and produce an
+independent final forecast. Apply at most one simple global offset or scale correction when the
+extracted evidence shows a clear systematic bias.
 
 ## Output Format (Turn 3 only)
 Your response MUST contain ONLY the two tags below, in this order, with no extra text before/between/after them.
-If you would "use the model predictions directly", paste the actual predicted values inside <answer> (do NOT say that phrase).
-<think>[Reflect predictions, note any adjustments]</think>
+Keep <think> to at most 40 tokens. If no single systematic bias is clear, say that there is no
+justified global correction. Paste the actual predicted values inside <answer>.
+<think>[<=40 tokens: no justified global correction, or name one global correction]</think>
 <answer>
 2017-05-05 00:00:00 12.345
 ...
@@ -50,34 +106,97 @@ If you would "use the model predictions directly", paste the actual predicted va
 - Turn 1: Feature extraction ONLY. Do NOT call predict_time_series.
 - Turn 2: Call predict_time_series ONLY after features are extracted.
 - Turn 3: Output answer ONLY after predictions are available.
+- Do not emit a blind verbatim copy of the reference forecast by default.
+- Either keep the reference forecast nearly unchanged because no justified global correction exists,
+  or apply one global offset/scale backed by the extracted evidence.
+- After Model Predictions appear, tool use is closed; never emit <tool_call> or <tools>.
+- Each <answer> row must contain a future timestamp and one finite plain decimal value.
 - Do NOT output anything outside <think> and <answer>. Missing <answer> tags is incorrect.
 """
 
-# OpenAI-compatible tool schemas for TimeSeriesForecast actions.
-PREDICT_TIMESERIES_TOOL_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "predict_time_series",
-        "description": (
-            "PREREQUISITE: You must have called feature extraction tools first (check 'Analysis History' is not empty). "
-            "Do NOT call this on Turn 1 - extract features first! "
-            "Models: 'chronos2' (default, preferred), 'itransformer' (cross-channel), 'arima' (trends), 'patchtst'."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "model_name": {
-                    "type": "string",
-                    "description": (
-                        "Model to use. Prefer 'chronos2' unless features strongly suggest another model."
-                    ),
-                    "enum": ["patchtst", "itransformer", "arima", "chronos2"]
-                }
+TIMESERIES_SYSTEM_PROMPT = build_timeseries_system_prompt()
+
+
+def build_predict_stage_instruction(
+    preferred_predict_model: str | None = None,
+    allowed_predict_model_names: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    preferred, allowed = normalize_predict_model_policy(
+        preferred_predict_model=preferred_predict_model,
+        allowed_predict_model_names=allowed_predict_model_names,
+    )
+    if len(allowed) == 1:
+        return f"Call predict_time_series with model_name '{preferred}'."
+    return (
+        "Call predict_time_series with your chosen model "
+        f"(prefer '{preferred}' unless features strongly suggest another allowed model: {', '.join(allowed)})."
+    )
+
+
+def build_predict_stage_state_check_line(
+    preferred_predict_model: str | None = None,
+    allowed_predict_model_names: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    preferred, allowed = normalize_predict_model_policy(
+        preferred_predict_model=preferred_predict_model,
+        allowed_predict_model_names=allowed_predict_model_names,
+    )
+    if len(allowed) == 1:
+        return (
+            '- If "Analysis History" has features but "Model Predictions" is empty '
+            f"-> Call predict_time_series with model_name (must be '{preferred}')."
+        )
+    return (
+        '- If "Analysis History" has features but "Model Predictions" is empty '
+        f"-> Call predict_time_series with model_name (prefer '{preferred}' unless features strongly "
+        f"suggest another allowed model: {', '.join(allowed)})."
+    )
+
+
+def build_predict_timeseries_tool_schema(
+    preferred_predict_model: str | None = None,
+    allowed_predict_model_names: list[str] | tuple[str, ...] | None = None,
+) -> dict:
+    preferred, allowed = normalize_predict_model_policy(
+        preferred_predict_model=preferred_predict_model,
+        allowed_predict_model_names=allowed_predict_model_names,
+    )
+    if len(allowed) == 1:
+        model_summary = f"Model: '{preferred}'."
+        model_description = f"Model to use. Must be '{preferred}'."
+    else:
+        model_summary = "Models: " + ", ".join(
+            f"'{model_name}' ({PREDICT_MODEL_DESCRIPTIONS[model_name]})" for model_name in allowed
+        ) + "."
+        model_description = f"Model to use. Prefer '{preferred}' unless features strongly suggest another model."
+
+    return {
+        "type": "function",
+        "function": {
+            "name": "predict_time_series",
+            "description": (
+                "PREREQUISITE: You must have called feature extraction tools first "
+                "(check 'Analysis History' is not empty). "
+                "Do NOT call this on Turn 1 - extract features first! "
+                f"{model_summary}"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "model_name": {
+                        "type": "string",
+                        "description": model_description,
+                        "enum": allowed,
+                    }
+                },
+                "required": ["model_name"],
             },
-            "required": ["model_name"],
         },
-    },
-}
+    }
+
+
+# OpenAI-compatible tool schemas for TimeSeriesForecast actions.
+PREDICT_TIMESERIES_TOOL_SCHEMA = build_predict_timeseries_tool_schema()
 
 EXTRACT_BASIC_STATISTICS_SCHEMA = {
     "type": "function",

@@ -80,12 +80,17 @@ class BaseModelConfig(BaseConfig):
 
 @dataclass
 class AgentFlowConfig(BaseConfig):
-    """AgentFlow config, compatible with verl AgentLoopConfig fields."""
+    """AgentFlow 配置，兼容 verl 的 AgentLoopConfig 字段。
+    
+    arft 使用 agent_flow 命名，但同时接受 verl 的 agent_loop 字段以便配置合并。
+    """
     num_workers: int = 8
     
+    # arft 字段
     default_agent_flow: str = "single_step_single_turn_agent"
     agent_flow_config_path: Optional[str] = None
     
+    # 兼容 verl 的旧字段（接受但忽略）
     default_agent_loop: Optional[str] = None
     agent_loop_config_path: Optional[str] = None
     

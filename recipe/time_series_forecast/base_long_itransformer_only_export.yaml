@@ -1,0 +1,10 @@
+- name: time_series_forecast_agent
+  _target_: recipe.time_series_forecast.time_series_forecast_agent_flow.TimeSeriesForecastAgentFlow
+  max_steps: 3
+  max_parallel_calls: 1
+  lookback_window: 96
+  forecast_horizon: 96
+  auto_finalize_prediction: false
+  preferred_predict_model: itransformer
+  allowed_predict_model_names:
+    - itransformer

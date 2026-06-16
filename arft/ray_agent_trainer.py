@@ -45,7 +45,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
-from metric_utils import (
+from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
@@ -85,6 +85,9 @@ def compute_advantage(
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
 ) -> DataProto:
+    # TODO: 重写所有 core_algos 中的 advantage 函数，适配新型的 agent flow 数据结构
+    # 多行 data 对应一条完整轨迹，通过 non_tensor_batch["trajectory_uids"] 来区分不同轨迹，每条轨迹包含多行 data。
+    # 通过 non_tensor_batch["step_indices"] 来区分同一条轨迹内的不同 step 的顺序。
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -156,6 +159,7 @@ class RayAgentTrainer(RayPPOTrainer):
     """
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        # TODO: 以轨迹为单位，将轨迹内的所有 step 的数据都 dump 出来。
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -183,9 +187,109 @@ class RayAgentTrainer(RayPPOTrainer):
 
         print(f"Dumped generations to {filename}")
 
+    def _to_jsonable(self, value):
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return [self._to_jsonable(item) for item in value.tolist()]
+        if isinstance(value, list):
+            return [self._to_jsonable(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._to_jsonable(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): self._to_jsonable(val) for key, val in value.items()}
+        return value
+
+    def _expand_rollout_numbers(self, sample_indices):
+        rollout_numbers = []
+        seen = defaultdict(int)
+        for sample_index in sample_indices:
+            sample_key = json.dumps(self._to_jsonable(sample_index), ensure_ascii=False, sort_keys=True)
+            rollout_numbers.append(seen[sample_key])
+            seen[sample_key] += 1
+        return rollout_numbers
+
+    def _dump_validation_trajectory_steps(
+        self,
+        full_trajectory_batch: DataProto,
+        repeated_input_batch: DataProto,
+        num_steps: list[int],
+        final_scores: list[float],
+        dump_path: str,
+    ):
+        """Dump step-level validation trajectories for later multiturn SFT conversion."""
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+
+        response_ids = full_trajectory_batch.batch["responses"]
+        response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in response_ids]
+
+        raw_prompts = full_trajectory_batch.non_tensor_batch.get("raw_prompt")
+        sanitized_response_texts = full_trajectory_batch.non_tensor_batch.get("sanitized_response_text")
+        trajectory_uids = full_trajectory_batch.non_tensor_batch.get("trajectory_uids")
+        step_indices = full_trajectory_batch.non_tensor_batch.get("step_indices")
+        num_turns = full_trajectory_batch.non_tensor_batch.get("__num_turns__")
+
+        sample_indices = repeated_input_batch.non_tensor_batch.get("index", np.arange(len(repeated_input_batch)))
+        data_sources = repeated_input_batch.non_tensor_batch.get(
+            "data_source", np.array([None] * len(repeated_input_batch), dtype=object)
+        )
+        rollout_numbers = self._expand_rollout_numbers(sample_indices)
+        prompt_uids = repeated_input_batch.non_tensor_batch.get("uid", np.array([None] * len(repeated_input_batch), dtype=object))
+        ground_truths = [
+            item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in repeated_input_batch
+        ]
+
+        score_by_uid = {}
+        cursor = 0
+        for traj_idx, step_count in enumerate(num_steps):
+            if step_count <= 0:
+                continue
+            trajectory_uid = str(trajectory_uids[cursor + step_count - 1])
+            score_by_uid[trajectory_uid] = final_scores[traj_idx]
+            cursor += step_count
+
+        lines = []
+        cursor = 0
+        for traj_idx, step_count in enumerate(num_steps):
+            sample_index = sample_indices[traj_idx]
+            data_source = data_sources[traj_idx]
+            rollout_n = rollout_numbers[traj_idx]
+            prompt_uid = prompt_uids[traj_idx]
+            ground_truth = ground_truths[traj_idx]
+
+            for _ in range(step_count):
+                response_text = response_texts[cursor]
+                if sanitized_response_texts is not None:
+                    candidate = sanitized_response_texts[cursor]
+                    if candidate:
+                        response_text = str(candidate)
+                entry = {
+                    "global_step": self.global_steps,
+                    "sample_index": self._to_jsonable(sample_index),
+                    "data_source": self._to_jsonable(data_source),
+                    "rollout_n": rollout_n,
+                    "prompt_uid": self._to_jsonable(prompt_uid),
+                    "ground_truth": self._to_jsonable(ground_truth),
+                    "trajectory_uid": str(trajectory_uids[cursor]),
+                    "step_index": int(step_indices[cursor]),
+                    "num_turns": int(num_turns[cursor]) if num_turns is not None else None,
+                    "raw_prompt": self._to_jsonable(raw_prompts[cursor]) if raw_prompts is not None else None,
+                    "response_text": response_text,
+                    "final_score": self._to_jsonable(score_by_uid.get(str(trajectory_uids[cursor]))),
+                }
+                lines.append(json.dumps(entry, ensure_ascii=False))
+                cursor += 1
+
+        with open(filename, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        print(f"Dumped validation trajectories to {filename}")
+
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
+        # TODO: 以轨迹为单位，将轨迹内的所有 step 的数据都 dump 出来。
         """Log rollout data to disk.
         Args:
             batch (DataProto): The batch containing rollout data
@@ -216,6 +320,7 @@ class RayAgentTrainer(RayPPOTrainer):
             )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
+        # TODO: 以轨迹为单位
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.log_val_generations
@@ -264,6 +369,12 @@ class RayAgentTrainer(RayPPOTrainer):
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
+            # Preserve dataset-level sample indices before _get_gen_batch() pops them out of test_batch.
+            # Agent loop outputs may attach their own local `index`, which is not stable across validation batches.
+            preserved_sample_indices = None
+            if "index" in test_batch.non_tensor_batch:
+                preserved_sample_indices = test_batch.non_tensor_batch["index"].copy()
+
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
@@ -292,6 +403,7 @@ class RayAgentTrainer(RayPPOTrainer):
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             test_output_gen_batch = self.async_rollout_manager.generate_sequences(test_gen_batch)
+            full_test_output_gen_batch = test_output_gen_batch
 
             # get indice for last step in each request
             # num_steps: [3,2,3] -> last_step_indice: [2,4,7]
@@ -299,6 +411,7 @@ class RayAgentTrainer(RayPPOTrainer):
                 num_steps = test_output_gen_batch.meta_info.pop("num_steps")
                 last_step_indice = np.array(num_steps).cumsum() - 1
             else:
+                num_steps = [1] * len(test_output_gen_batch)
                 last_step_indice = np.arange(len(test_output_gen_batch))
 
             # for validation, we only need the last step of each trajectory
@@ -312,6 +425,8 @@ class RayAgentTrainer(RayPPOTrainer):
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
+            if preserved_sample_indices is not None:
+                test_batch.non_tensor_batch["index"] = preserved_sample_indices
             test_batch.meta_info["validate"] = True
 
             # evaluate using reward_function
@@ -333,6 +448,16 @@ class RayAgentTrainer(RayPPOTrainer):
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+
+            validation_trajectory_dir = self.config.trainer.get("validation_trajectory_dir", None)
+            if validation_trajectory_dir:
+                self._dump_validation_trajectory_steps(
+                    full_trajectory_batch=full_test_output_gen_batch,
+                    repeated_input_batch=test_batch,
+                    num_steps=num_steps,
+                    final_scores=scores,
+                    dump_path=validation_trajectory_dir,
+                )
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -711,6 +836,7 @@ class RayAgentTrainer(RayPPOTrainer):
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
                         # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        # TODO: is_metrics 修正，如何过滤掉 pad 的 step？
                         if (
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch

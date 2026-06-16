@@ -16,6 +16,7 @@ import os
 import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
+from urllib.parse import urlparse
 from pydantic import BaseModel
 import pandas as pd
 from scipy.fft import fft, fftfreq
@@ -37,35 +38,72 @@ except ImportError:
 # Set MODEL_SERVICE_URL environment variable to use remote service
 # Default: http://localhost:8994
 # This unified service supports: chronos2, patchtst, itransformer
-_MODEL_SERVICE_URL = os.environ.get("MODEL_SERVICE_URL", "http://localhost:8994")
+_MODEL_SERVICE_URL = os.environ.get("MODEL_SERVICE_URL", "http://localhost:8993")
 
 # Legacy support: CHRONOS_SERVICE_URL (deprecated, use MODEL_SERVICE_URL instead)
 _CHRONOS_SERVICE_URL = os.environ.get("CHRONOS_SERVICE_URL", _MODEL_SERVICE_URL)
 
+_MODEL_SERVICE_TIMEOUT = float(
+    os.environ.get("MODEL_SERVICE_TIMEOUT", os.environ.get("CHRONOS_SERVICE_TIMEOUT", "300.0"))
+)
+
 # Global HTTP client cache for async requests
-_httpx_client = None
+_httpx_client_cache = {}
 
 # Default lengths resolved from env/base.yaml
 DEFAULT_LOOKBACK_WINDOW, DEFAULT_FORECAST_HORIZON = get_default_lengths()
 
 
-def _get_httpx_client():
-    """Get or create httpx async client"""
-    global _httpx_client
-    if _httpx_client is None:
+def _should_trust_env_for_service_url(service_url: str) -> bool:
+    """Return whether httpx should honor env proxy settings for the given service URL."""
+    hostname = urlparse(service_url).hostname
+    return hostname not in {"localhost", "127.0.0.1", "::1"}
+
+
+def _get_httpx_client(service_url: str):
+    """Get or create an httpx async client for a service URL."""
+    global _httpx_client_cache
+    trust_env = _should_trust_env_for_service_url(service_url)
+    cache_key = ("trust_env", trust_env, "timeout", _MODEL_SERVICE_TIMEOUT)
+    if cache_key not in _httpx_client_cache:
         import httpx
-        _httpx_client = httpx.AsyncClient(timeout=60.0)
-    return _httpx_client
+
+        _httpx_client_cache[cache_key] = httpx.AsyncClient(timeout=_MODEL_SERVICE_TIMEOUT, trust_env=trust_env)
+    return _httpx_client_cache[cache_key]
 
 
 # Supported prediction models
 SUPPORTED_MODELS = ["chronos2", "arima", "patchtst", "itransformer"]
 
 
+def _normalize_dataset_name(dataset_name: Optional[str]) -> Optional[str]:
+    if dataset_name is None:
+        return None
+    normalized = str(dataset_name).strip()
+    if not normalized:
+        return None
+    return normalized.upper()
+
+
+def _resolve_dataset_name(
+    context_df: pd.DataFrame,
+    dataset_name: Optional[str] = None,
+    data_source: Optional[str] = None,
+) -> Optional[str]:
+    return _normalize_dataset_name(
+        dataset_name
+        or data_source
+        or context_df.attrs.get("dataset_name")
+        or context_df.attrs.get("data_source")
+    )
+
+
 async def predict_time_series_async(
     context_df: pd.DataFrame, 
     prediction_length: int = DEFAULT_FORECAST_HORIZON,
-    model_name: str = "chronos2"
+    model_name: str = "chronos2",
+    dataset_name: Optional[str] = None,
+    data_source: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Predict time series using the specified model (async version).
@@ -88,14 +126,24 @@ async def predict_time_series_async(
     """
     model_name = model_name.lower().strip()
     
+    resolved_dataset_name = _resolve_dataset_name(context_df, dataset_name=dataset_name, data_source=data_source)
+
     if model_name == "chronos2":
         return await predict_with_chronos_async(context_df, prediction_length)
     elif model_name == "arima":
         return await predict_with_arima_async(context_df, prediction_length)
     elif model_name == "patchtst":
-        return await predict_with_patchtst_async(context_df, prediction_length)
+        return await predict_with_patchtst_async(
+            context_df,
+            prediction_length,
+            dataset_name=resolved_dataset_name,
+        )
     elif model_name == "itransformer":
-        return await predict_with_itransformer_async(context_df, prediction_length)
+        return await predict_with_itransformer_async(
+            context_df,
+            prediction_length,
+            dataset_name=resolved_dataset_name,
+        )
     else:
         raise ValueError(f"Unsupported model: {model_name}. Supported models: {SUPPORTED_MODELS}")
 
@@ -107,9 +155,9 @@ async def predict_with_chronos_async(
     """
     Predict time series using Chronos2 service (async version).
     
-    This function calls a remote Chronos2 service to generate time series forecasts.
-    The service should be started separately with: 
-        CUDA_VISIBLE_DEVICES=3 python chronos_server.py --port 8994
+    This function calls a remote model service to generate time series forecasts.
+    The service should be started separately with:
+        CUDA_VISIBLE_DEVICES=0 python model_server.py --port 8993 --device cuda
     
     Args:
         context_df: DataFrame containing historical data.
@@ -121,7 +169,7 @@ async def predict_with_chronos_async(
     """
     import httpx
     
-    client = _get_httpx_client()
+    client = _get_httpx_client(_CHRONOS_SERVICE_URL)
     
     # Prepare request data
     timestamps = []
@@ -263,6 +311,7 @@ async def predict_with_arima_async(
 async def predict_with_patchtst_async(
     context_df: pd.DataFrame,
     prediction_length: int = DEFAULT_FORECAST_HORIZON,
+    dataset_name: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Predict time series using PatchTST model via the unified model service (async version).
@@ -283,7 +332,7 @@ async def predict_with_patchtst_async(
     """
     import httpx
     
-    client = _get_httpx_client()
+    client = _get_httpx_client(_MODEL_SERVICE_URL)
     
     # Prepare request data
     timestamps = []
@@ -303,6 +352,8 @@ async def predict_with_patchtst_async(
         "prediction_length": prediction_length,
         "model_name": "patchtst"
     }
+    if dataset_name:
+        request_data["dataset_name"] = dataset_name
     
     # Call the unified model service
     try:
@@ -325,6 +376,7 @@ async def predict_with_patchtst_async(
 async def predict_with_itransformer_async(
     context_df: pd.DataFrame,
     prediction_length: int = DEFAULT_FORECAST_HORIZON,
+    dataset_name: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Predict time series using iTransformer model via the unified model service (async version).
@@ -345,7 +397,7 @@ async def predict_with_itransformer_async(
     """
     import httpx
     
-    client = _get_httpx_client()
+    client = _get_httpx_client(_MODEL_SERVICE_URL)
     
     # Prepare request data
     timestamps = []
@@ -365,6 +417,8 @@ async def predict_with_itransformer_async(
         "prediction_length": prediction_length,
         "model_name": "itransformer"
     }
+    if dataset_name:
+        request_data["dataset_name"] = dataset_name
     
     # Call the unified model service
     try:
@@ -391,9 +445,9 @@ def predict_time_series(
     """
     Predict time series using Chronos2 service (sync version).
     
-    This function calls a remote Chronos2 service to generate time series forecasts.
-    The service should be started separately with: 
-        CUDA_VISIBLE_DEVICES=3 python chronos_server.py --port 8994
+    This function calls a remote model service to generate time series forecasts.
+    The service should be started separately with:
+        CUDA_VISIBLE_DEVICES=0 python model_server.py --port 8993 --device cuda
     
     Args:
         context_df: DataFrame containing historical data.

@@ -1,62 +1,21 @@
-#!/bin/bash
-# =============================================================================
-# Unified Time Series Prediction Service Startup Script
-# =============================================================================
-#
-# This script starts the unified prediction service that loads all available
-# models (Chronos2, PatchTST, iTransformer) on a dedicated GPU.
-#
-# Run this BEFORE starting the training script.
-#
-# Usage:
-#   ./start_model_server.sh           # Uses GPU 3 by default, port 8994
-#   ./start_model_server.sh 2         # Uses GPU 2
-#   ./start_model_server.sh 3 8995    # Uses GPU 3, port 8995
-#
-# =============================================================================
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Configuration
-GPU_ID=${1:-0}          # Default: GPU 3
-PORT=${2:-8994}         # Default: port 8994
-HOST="0.0.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Get the directory where this script is located
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+VISIBLE_DEVICES="${1:-${VISIBLE_DEVICES:-0}}"
+PORT="${2:-${PORT:-8993}}"
+DEVICE="${3:-${DEVICE:-cuda}}"
+HOST="${HOST:-0.0.0.0}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
-# Get the project root directory (two levels up from script dir)
-PROJECT_ROOT="$( cd "$SCRIPT_DIR/../.." && pwd )"
+export PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
-# Add project root to PYTHONPATH so that imports like 'recipe.time_series_forecast...' work
-export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
-
-echo "============================================================"
-echo "  Unified Time Series Prediction Service"
-echo "============================================================"
-echo "  GPU:  $GPU_ID"
-echo "  Port: $PORT"
-echo "  Host: $HOST"
-echo "============================================================"
-echo ""
-echo "  Available Models:"
-echo "    - Chronos2:     Foundation model for time series"
-echo "    - PatchTST:     Patch-based Transformer"
-echo "    - iTransformer: Inverted Transformer"
-echo ""
-echo "  Models will be loaded if checkpoint exists."
-echo "============================================================"
-
-# Set CUDA device and start the server
 cd "$SCRIPT_DIR"
-CUDA_VISIBLE_DEVICES=$GPU_ID python model_server.py --host $HOST --port $PORT --device cuda
+if [[ "$DEVICE" == cuda* ]]; then
+  exec env CUDA_VISIBLE_DEVICES="$VISIBLE_DEVICES" \
+    "$PYTHON_BIN" model_server.py --host "$HOST" --port "$PORT" --device "$DEVICE"
+fi
 
-# =============================================================================
-# Alternative: run with nohup in background
-# =============================================================================
-# Uncomment the lines below to run in background:
-#
-# CUDA_VISIBLE_DEVICES=$GPU_ID nohup python model_server.py --host $HOST --port $PORT --device cuda > model_server.log 2>&1 &
-# echo "Server started in background. PID: $!"
-# echo "Log file: model_server.log"
-# echo ""
-# echo "To check status: curl http://localhost:$PORT/health"
-# echo "To see models:   curl http://localhost:$PORT/models"
+exec "$PYTHON_BIN" model_server.py --host "$HOST" --port "$PORT" --device "$DEVICE"
