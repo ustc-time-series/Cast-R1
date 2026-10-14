@@ -16,11 +16,12 @@ from torch.utils.data import DataLoader, Dataset
 from recipe.time_series_forecast.models.itransformer.model import create_itransformer_model
 from recipe.time_series_forecast.models.patchtst.model import create_patchtst_model
 from recipe.time_series_forecast.config_utils import get_dataset_lengths
+from recipe.time_series_forecast.forecast_task import ForecastTask, parse_rows
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATA_ROOT = PROJECT_ROOT / "datasets" / "RL"
-DEFAULT_MODEL_ROOT = PROJECT_ROOT / "tmp" / "small-model-checkpoints"
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "datasets" / "PAPER_RAW"
+DEFAULT_MODEL_ROOT = PROJECT_ROOT / "recipe" / "time_series_forecast" / "models"
 DEFAULT_DATASETS = ("ETTH1", "ETTH2", "ETTM1", "ETTM2", "WIND", "NP", "PJM", "BE", "DE", "FR")
 DEFAULT_MODELS = ("itransformer", "patchtst")
 
@@ -44,10 +45,16 @@ def load_parquet_window_data(
     dataframe = pd.read_parquet(parquet_path)
     inputs = []
     targets = []
+    input_columns = None
     for row_idx, row in dataframe.iterrows():
         prompt = row["prompt"][0]["content"]
         ground_truth = row["reward_model"]["ground_truth"]
-        input_values = _parse_series_values(prompt)
+        task = ForecastTask.from_content(prompt, horizon=pred_len)
+        columns = [task.target_name, *task.historical_covariates]
+        if input_columns is not None and columns != input_columns:
+            raise ValueError("All windows for a checkpoint must use identical channel order")
+        input_columns = columns
+        input_values = np.column_stack([task.values, *task.historical_covariates.values()]).tolist()
         target_values = _parse_series_values(ground_truth)
         if len(input_values) != seq_len or len(target_values) != pred_len:
             raise ValueError(
@@ -57,7 +64,7 @@ def load_parquet_window_data(
         inputs.append(input_values)
         targets.append(target_values)
 
-    input_tensor = torch.tensor(inputs, dtype=torch.float32).unsqueeze(-1)
+    input_tensor = torch.tensor(inputs, dtype=torch.float32)
     target_tensor = torch.tensor(targets, dtype=torch.float32).unsqueeze(-1)
     return input_tensor, target_tensor
 
@@ -91,6 +98,7 @@ class SmallModelTrainingConfig:
     seq_len: int = 96
     pred_len: int = 96
     enc_in: int = 1
+    input_columns: list[str] | None = None
     d_model: int | None = None
     n_heads: int | None = None
     e_layers: int | None = None
@@ -133,6 +141,7 @@ def _model_config(config: SmallModelTrainingConfig) -> dict:
             "seq_len": config.seq_len,
             "pred_len": config.pred_len,
             "enc_in": config.enc_in,
+            "input_columns": config.input_columns,
             "d_model": config.d_model or 128,
             "n_heads": config.n_heads or 8,
             "e_layers": config.e_layers or 2,
@@ -144,6 +153,7 @@ def _model_config(config: SmallModelTrainingConfig) -> dict:
             "seq_len": config.seq_len,
             "pred_len": config.pred_len,
             "enc_in": config.enc_in,
+            "input_columns": config.input_columns,
             "d_model": config.d_model or 512,
             "n_heads": config.n_heads or 2,
             "e_layers": config.e_layers or 1,
@@ -185,7 +195,7 @@ def _mean_epoch_loss(model: nn.Module, loader: DataLoader, criterion: nn.Module,
         for inputs, targets in loader:
             inputs = inputs.to(device)
             targets = targets.to(device)
-            predictions = model(inputs)
+            predictions = model(inputs)[:, :, :1]
             losses.append(float(criterion(predictions, targets).detach().cpu()))
     return float(np.mean(losses)) if losses else float("nan")
 
@@ -214,6 +224,12 @@ def train_and_save(config: SmallModelTrainingConfig) -> dict[str, float]:
         num_workers=config.num_workers,
     )
 
+    config.enc_in = train_loader.dataset.inputs.shape[-1]
+    first = pd.read_parquet(config.train_file).iloc[0]
+    task = ForecastTask.from_content(first["prompt"][0]["content"], horizon=config.pred_len)
+    config.input_columns = [task.target_name, *task.historical_covariates]
+    if val_loader.dataset.inputs.shape[-1] != config.enc_in:
+        raise ValueError("Training and validation checkpoints need the same channels")
     model = build_model(config).to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
@@ -230,7 +246,7 @@ def train_and_save(config: SmallModelTrainingConfig) -> dict[str, float]:
             inputs = inputs.to(device)
             targets = targets.to(device)
             optimizer.zero_grad(set_to_none=True)
-            predictions = model(inputs)
+            predictions = model(inputs)[:, :, :1]
             loss = criterion(predictions, targets)
             loss.backward()
             if config.grad_clip > 0:
@@ -276,6 +292,10 @@ def _split_csv(raw_value: str) -> tuple[str, ...]:
 
 
 def _resolve_dataset_dir(data_root: Path, dataset: str) -> Path:
+    if data_root.exists():
+        for child in data_root.iterdir():
+            if child.is_dir() and child.name.upper() == dataset.upper():
+                return child
     dataset_dir = data_root / dataset
     if dataset_dir.exists():
         return dataset_dir

@@ -28,6 +28,8 @@ from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 
 from recipe.time_series_forecast.prompts import *
+from recipe.time_series_forecast.forecast_task import ForecastTask, build_state_messages, parse_rows
+from recipe.time_series_forecast.forecast_harness import DIAGNOSTICS, diagnose, predict as predict_task
 from recipe.time_series_forecast.utils import (
     parse_time_series_string,
     parse_time_series_to_dataframe,
@@ -46,7 +48,8 @@ from recipe.time_series_forecast.utils import (
     format_event_summary,
 )
 from recipe.time_series_forecast.reward import (
-    compute_raw_relative_score,
+    compute_score,
+    compute_raw_mse_mae,
     extract_values_from_time_series_string,
     extract_ground_truth_values,
 )
@@ -79,6 +82,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.timestamps = None
         self.values = None
         self.prediction_results = None
+        self.prediction_model = None
         self.final_answer = None
 
         # Feature extraction caches
@@ -103,6 +107,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         cls.lookback_window = kwargs.get("lookback_window", 96)
         cls.forecast_horizon = kwargs.get("forecast_horizon", 96)
         cls.auto_finalize_prediction = kwargs.get("auto_finalize_prediction", False)
+        cls.allow_tool_fallback = kwargs.get("allow_tool_fallback", False)
         cls.allowed_predict_model_names = kwargs.get("allowed_predict_model_names")
         cls.preferred_predict_model = kwargs.get("preferred_predict_model")
         cls.tool_parser = ToolParser.get_tool_parser(config.actor_rollout_ref.rollout.multi_turn.format, cls.tokenizer)
@@ -113,7 +118,17 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentFlowOutput:
         raw_prompt = list(kwargs["raw_prompt"])
-        self.time_series_data = raw_prompt[0]["content"]
+        self._is_validation = bool(kwargs.get("is_validation", False))
+        extra_info = kwargs.get("extra_info")
+        if isinstance(extra_info, dict) and extra_info.get("split") in {"val", "test"} and not self._is_validation:
+            raise ValueError("Validation/test samples cannot be used for RL optimization")
+        self.task = ForecastTask.from_content(
+            raw_prompt[0]["content"], horizon=self.forecast_horizon,
+            dataset_name=self._get_dataset_name(kwargs) or "",
+        )
+        self.lookback_window = len(self.task.values)
+        self.forecast_horizon = self.task.horizon
+        self.time_series_data = self.task.history_text
         self.messages = self._build_initial_messages()
         
         # Get ground_truth from reward_model field
@@ -123,7 +138,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         
         # Parse the input data once at the beginning
         try:
-            self.timestamps, self.values = parse_time_series_string(self.time_series_data)
+            self.timestamps, self.values = self.task.timestamps, self.task.values
         except Exception as e:
             logger.error(f"Error parsing time series data: {e}")
             self.timestamps, self.values = [], []
@@ -354,12 +369,19 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
         answer_values = extract_values_from_time_series_string(final_answer)
         finite_answer_values = [value for value in answer_values if np.isfinite(value)]
-        if len(finite_answer_values) < self.forecast_horizon:
+        if not finite_answer_values or len(finite_answer_values) != len(answer_values):
             return (
                 False,
                 -0.5,
-                f"Final answer must contain at least {self.forecast_horizon} finite forecast values.",
+                "Final answer must contain finite forecast values.",
             )
+
+        if getattr(self, "task", None) is not None:
+            timestamps, values = parse_rows(final_answer)
+            count = min(len(values), self.forecast_horizon)
+            if (not count or timestamps[:count] != self.task.future_timestamps[:count]
+                    or len(values) != len(answer_values)):
+                return False, -0.5, "Forecast timestamps do not match the future task grid"
         
         # Check 3: Check if answer is just copying the input data (reward hacking detection)
         if self._is_copying_input(final_answer):
@@ -471,19 +493,15 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         Returns:
             Reward score
         """
-        if not ground_truth:
+        if not ground_truth or getattr(self, "_is_validation", False):
             return 0.0
         
         try:
-            extra_info = {"dataset_name": dataset_name}
-            if include_reference_prediction:
-                extra_info["reference_prediction"] = self.prediction_results
-
-            score = compute_raw_relative_score(
+            score = compute_score(
                 data_source=dataset_name or "time_series",
                 solution_str=f"<answer>{final_answer}</answer>",
                 ground_truth=ground_truth,
-                extra_info=extra_info,
+                extra_info={"dataset_name": dataset_name},
             )
             return score
         except Exception as e:
@@ -512,20 +530,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
     def _compute_mse_mae_from_time_series_text(self, prediction_text: str, ground_truth: str) -> tuple[float, float]:
         """Compute raw-scale MSE/MAE from prediction and ground-truth time-series text."""
-        pred_values = extract_values_from_time_series_string(prediction_text)
-        gt_values = extract_ground_truth_values(ground_truth)
-
-        if not pred_values or not gt_values:
-            return np.nan, np.nan
-
-        min_len = min(len(pred_values), len(gt_values))
-        if min_len <= 0:
-            return np.nan, np.nan
-
-        pred_arr = np.array(pred_values[:min_len], dtype=float)
-        gt_arr = np.array(gt_values[:min_len], dtype=float)
-
-        return float(np.mean((pred_arr - gt_arr) ** 2)), float(np.mean(np.abs(pred_arr - gt_arr)))
+        return compute_raw_mse_mae(prediction_text, ground_truth)
 
     def _workflow_state(self) -> tuple[bool, bool, bool, bool, bool, bool]:
         """Return coarse workflow state flags used to distinguish progress from duplicate calls."""
@@ -539,8 +544,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         )
 
     def _compute_intermediate_tool_reward(self, *, model_progress_made: bool) -> float:
-        """Only reward tool calls that move the workflow to a new state."""
-        return 0.02 if model_progress_made else 0.0
+        """Only terminal outcomes are rewarded in the paper's objective."""
+        return 0.0
 
     def _allowed_predict_models(self) -> list[str]:
         _, allowed = normalize_predict_model_policy(
@@ -563,6 +568,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
     def _normalize_predict_model_name(self, model_name: Any) -> str:
         candidate = str(model_name or "").strip().lower()
+        if not getattr(self, "allow_tool_fallback", False):
+            if candidate not in self._allowed_predict_models():
+                raise ValueError(f"The policy must explicitly select an allowed forecasting model: {candidate!r}")
+            return candidate
         if not self._has_predict_model_policy():
             if candidate not in PREDICT_MODEL_NAMES:
                 return "chronos2"
@@ -590,7 +599,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             model_field["enum"] = allowed
             model_field["description"] = (
                 f"Model to use. Prefer '{preferred}'. Allowed: {', '.join(allowed)}."
-            )
+            ) if getattr(self, "preferred_predict_model", None) else "Select a model using the diagnostic evidence in Analysis History."
         return schema_copy
 
     def _current_tool_schemas(self) -> list[dict] | None:
@@ -642,7 +651,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             if tool_name in allowed_tool_names:
                 filtered.append(tool_call)
                 continue
-            if tool_name in PREDICT_MODEL_NAMES and "predict_time_series" in allowed_tool_names:
+            if (getattr(self, "allow_tool_fallback", False) and tool_name in PREDICT_MODEL_NAMES
+                    and "predict_time_series" in allowed_tool_names):
                 filtered.append(tool_call)
                 continue
             skipped = True
@@ -652,6 +662,9 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 sorted(allowed_tool_names),
             )
 
+        if "predict_time_series" in allowed_tool_names and len(filtered) > 1:
+            logger.warning("Forecasting requires exactly one model-selection call")
+            return [], True
         return filtered, skipped
 
     def _should_auto_predict_after_no_progress(self, tool_calls: list[Any], model_progress_made: bool) -> bool:
@@ -660,7 +673,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         rewarding that duplicate action. This prevents max-step exhaustion while preserving the
         learning signal that duplicate tools are not useful.
         """
-        if model_progress_made or not tool_calls:
+        if not getattr(self, "allow_tool_fallback", False) or model_progress_made or not tool_calls:
             return False
         if not self._has_any_feature_analysis() or self.prediction_results is not None:
             return False
@@ -671,7 +684,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         If the initial feature stage emits tool markup that the parser cannot recover, salvage the
         step by executing a minimal feature extraction once instead of repeating Turn 1 forever.
         """
-        if tool_calls:
+        if not getattr(self, "allow_tool_fallback", False) or tool_calls:
             return False
         if self._has_any_feature_analysis() or self.prediction_results is not None:
             return False
@@ -682,7 +695,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         If the model reaches prediction stage but only emits malformed tool markup, salvage the step by
         executing the preferred prediction model once instead of exhausting the trajectory with a -0.5.
         """
-        if tool_calls:
+        if not getattr(self, "allow_tool_fallback", False) or tool_calls:
             return False
         if not self._has_any_feature_analysis() or self.prediction_results is not None:
             return False
@@ -777,7 +790,12 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
     def _apply_no_final_answer_penalty(self) -> None:
         """Penalize trajectories that exhaust max steps without a valid final answer."""
         if self.final_answer is None and self.steps:
-            self.steps[-1].reward_score = -0.5
+            self.steps[-1].reward_score = -1.0
+        for step in self.steps[:-1]:
+            step.reward_score = 0.0
+        if getattr(self, "_is_validation", False):
+            for step in self.steps:
+                step.reward_score = 0.0
 
     def _get_predict_model_name(self, tool_call: FunctionCall) -> str:
         model_name = None
@@ -790,13 +808,24 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     args = {}
             if isinstance(args, dict):
                 model_name = args.get("model_name")
-        return self._normalize_predict_model_name(model_name)
+        return self._normalize_predict_model_name(model_name) if getattr(self, "allow_tool_fallback", False) else model_name
 
     async def _execute_tool_call(self, tool_call: FunctionCall, **kwargs) -> None:
         tool_name = getattr(tool_call, "name", None)
         if not hasattr(self, "history_analysis") or self.history_analysis is None:
             self.history_analysis = []
         history_len_before = len(self.history_analysis)
+
+        if tool_name in DIAGNOSTICS and getattr(self, "task", None) is not None:
+            try:
+                result, observation = await diagnose(self.task, tool_name)
+            except Exception as exc:
+                self.history_analysis.append(f"Diagnostic failed ({tool_name}): {type(exc).__name__}")
+                logger.warning("Diagnostic %s failed: %s", tool_name, exc)
+                return
+            setattr(self, DIAGNOSTICS[tool_name][2], result)
+            self.history_analysis.append(observation)
+            return
 
         if tool_name == "predict_time_series" or tool_name in PREDICT_MODEL_NAMES:
             # 强制工作流：必须先进行特征分析才能调用预测。
@@ -865,77 +894,22 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         return self._build_user_prompt()
 
     def _build_initial_messages(self) -> list[dict]:
-        return [
-            {
-                "role": "system",
-                "content": build_timeseries_system_prompt(
-                    getattr(self, "preferred_predict_model", None),
-                    getattr(self, "allowed_predict_model_names", None),
-                ),
-            },
-            {"role": "user", "content": self._build_initial_user_prompt()},
-        ]
-
-    def _build_user_prompt(self) -> str:
-        """Backward-compatible dynamic prompt builder used by prompt/unit-test helpers."""
-        history = self._format_history_analysis()
-        prediction = self._format_prediction_results()
-        turn_num, action = self._get_current_turn_info()
-        use_truncated_history = self._has_any_feature_analysis() or self.prediction_results is not None
-        historical_data_title = "### Historical Data (truncated)" if use_truncated_history else "### Historical Data"
-        historical_data = (
-            self._truncate_time_series_data(self.time_series_data) if use_truncated_history else self.time_series_data
+        task = getattr(self, "task", None)
+        if task is None:
+            task = ForecastTask.from_content(self.time_series_data, horizon=self.forecast_horizon)
+        return build_state_messages(
+            task, self.history_analysis, self.prediction_results,
+            getattr(self, "preferred_predict_model", None),
+            getattr(self, "allowed_predict_model_names", None),
+            prediction_model=getattr(self, "prediction_model", None),
         )
 
-        if self.prediction_results:
-            return f"""**[Turn {turn_num}] Action: {action}**
-### Lookback Window: {self.lookback_window} rows
-### Forecast Horizon: {self.forecast_horizon} rows
-{historical_data_title}
-{historical_data}
-
-### Analysis History
-{history}
-
-### Model Predictions
-{prediction}
-
-**Instructions**:
-1. Treat the Model Predictions as a reference forecast, not ground truth
-2. Do not treat the reference forecast as the final answer automatically; decide whether one justified global correction is needed
-3. <think> must be <= 40 tokens; if no single systematic bias is clear, say "no justified global correction"
-4. Use only one global offset or scale correction when level, trend, residual, or quality signals show clear systematic bias
-5. After Model Predictions appear, tool use is closed; never emit <tool_call> or <tools>
-6. Output ONLY <think>...</think> and <answer>...</answer>, nothing else
-7. The <answer> content must contain exactly {self.forecast_horizon} future timestamp-value rows
-8. Each row must use format "YYYY-MM-DD HH:MM:SS finite plain decimal", not NaN/Inf/null/placeholders."""
-
-        return f"""**[Turn {turn_num}] Action: {action}**
-### Lookback Window: {self.lookback_window} rows
-### Forecast Horizon: {self.forecast_horizon} rows
-{historical_data_title}
-{historical_data}
-
-### Analysis History
-{history}
-
-### Model Predictions
-{prediction}
-
-**Check your current state and act accordingly:**
-- If "Analysis History" is empty → Call feature extraction tools (e.g., extract_basic_statistics). Do NOT call predict_time_series yet.
-{build_predict_stage_state_check_line(
-    getattr(self, "preferred_predict_model", None),
-    getattr(self, "allowed_predict_model_names", None),
-)}
-"""
+    def _build_user_prompt(self) -> str:
+        return self._build_initial_messages()[1]["content"]
 
     def _build_current_messages(self) -> list[dict]:
-        """Build the exact messages for the current agent step."""
-        if not self.messages:
-            self.messages = self._build_initial_messages()
-        elif self.messages[-1]["role"] != "user":
-            self.messages.append({"role": "user", "content": self._build_user_prompt()})
+        """Rebuild P(z, M_k), excluding previous responses and raw tool messages."""
+        self.messages = self._build_initial_messages()
         return [dict(message) for message in self.messages]
 
     def _append_message(self, role: str, content: str) -> None:
@@ -1006,6 +980,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         """
         try:
             model_name = self._normalize_predict_model_name(model_name)
+            if getattr(self, "task", None) is not None:
+                self.prediction_results = await predict_task(self.task, model_name)
+                self.prediction_model = model_name
+                return 0.0
             if not self.values or len(self.values) < 2:
                 logger.warning("Insufficient data for prediction")
                 return 0.0
@@ -1027,6 +1005,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
             # Format predictions as string
             self.prediction_results = format_predictions_to_string(pred_df, last_ts)
+            self.prediction_model = model_name
 
             # Record to history with model name
             dataset_suffix = f" for dataset {dataset_name}" if dataset_name else ""

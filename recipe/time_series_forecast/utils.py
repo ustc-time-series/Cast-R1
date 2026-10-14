@@ -27,6 +27,7 @@ from sklearn.decomposition import PCA
 from collections import Counter
 
 from recipe.time_series_forecast.config_utils import get_default_lengths
+from recipe.time_series_forecast.forecast_task import NUMBER
 
 try:
     import ruptures as rpt
@@ -523,6 +524,10 @@ def parse_time_series_string(data_str: str) -> Tuple[List[str], List[float]]:
         >>> print(values)
         [11.588, 10.918]
     """
+    if data_str.lstrip().startswith("{"):
+        from recipe.time_series_forecast.forecast_task import ForecastTask
+        task = ForecastTask.from_content(data_str)
+        return task.timestamps, task.values
     timestamps = []
     values = []
     
@@ -534,7 +539,7 @@ def parse_time_series_string(data_str: str) -> Tuple[List[str], List[float]]:
         
         # Pattern: datetime (YYYY-MM-DD HH:MM:SS) followed by value
         # The datetime has format "2017-05-01 00:00:00" and value is a float
-        match = re.match(r'^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+(-?\d+\.?\d*)$', line)
+        match = re.match(rf'^(\d{{4}}-\d{{2}}-\d{{2}}\s+\d{{2}}:\d{{2}}:\d{{2}})\s+({NUMBER})$', line)
         if match:
             timestamps.append(match.group(1))
             values.append(float(match.group(2)))
@@ -804,14 +809,17 @@ def extract_basic_statistics(data: List[float], seasonal_period: int = 24) -> Di
             'qkurt': 0.0, 'mean_abs_corr': 0.0, 'pca_var_ratio1': 0.0
         }
 
-    arr = np.array(data, dtype=float).reshape(-1, 1)
+    arr = np.array(data, dtype=float)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    if arr.ndim != 2:
+        raise ValueError("Statistics expect a time-by-channel matrix")
 
     features = {}
 
-    features['median'] = float(np.median(arr))
+    features['median'] = float(np.median(arr[:, 0]))
 
-    median_val = np.median(arr, axis=0)
-    features['mad'] = float(np.median(np.abs(arr - median_val)))
+    features['mad'] = float(np.mean(np.abs(arr[:, 0] - np.mean(arr[:, 0]))))
 
     try:
         acf_result = acf(arr[:, 0], nlags=1, fft=True)
@@ -867,7 +875,12 @@ def extract_basic_statistics(data: List[float], seasonal_period: int = 24) -> Di
     except Exception:
         features['qkurt'] = 0.0
 
-    features['mean_abs_corr'] = 0.0
+    if arr.shape[1] > 1:
+        correlations = np.corrcoef(arr, rowvar=False)
+        upper = correlations[np.triu_indices(arr.shape[1], k=1)]
+        features['mean_abs_corr'] = float(np.mean(np.abs(upper[np.isfinite(upper)]))) if np.isfinite(upper).any() else 0.0
+    else:
+        features['mean_abs_corr'] = 0.0
 
     try:
         if arr.shape[1] >= 2:

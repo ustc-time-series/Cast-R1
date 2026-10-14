@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable
 
 import pandas as pd
+import numpy as np
 
 from recipe.time_series_forecast import etth1_raw_dataset_builder as base_builder
 from recipe.time_series_forecast.config_utils import get_dataset_lengths
@@ -225,6 +226,7 @@ def build_train_only_banddrop_split_frames(
             )
             for _, row in annotated_df.iterrows()
         ]
+        annotated_df = annotated_df.loc[np.isfinite(annotated_df["teacher_mse"])].copy()
         annotated_df["mse_rank"] = annotated_df["teacher_mse"].rank(pct=True, method="average")
         annotated_df["entropy_rank"] = annotated_df["entropy"].rank(pct=True, method="average")
         annotated_df["band"] = annotated_df.apply(base_builder.assign_band, axis=1)
@@ -301,134 +303,73 @@ def build_ett_rl_split_frames(
     return base_builder.finalize_split_frames(split_frames)
 
 
-def build_full_csv_banddrop_split_frames(
-    dataset_name: str,
-    *,
-    raw_root: str | Path = DEFAULT_DATASETS_RAW_ROOT,
-    variant: str = "banddrop",
-    teacher_mse_fn: TeacherMSEFn | None = None,
-    server_url: str = base_builder.MODEL_SERVER_URL,
-    teacher_model_name: str = base_builder.TEACHER_MODEL_NAME,
-    lookback_window: int | None = None,
-    forecast_horizon: int | None = None,
-) -> dict[str, pd.DataFrame]:
-    dataset_name = dataset_name.upper()
-    if dataset_name not in FULL_CSV_DATASETS:
-        valid_names = ", ".join(FULL_CSV_DATASETS)
-        raise ValueError(f"Unknown full CSV dataset '{dataset_name}'. Valid names: {valid_names}")
-
-    dataset_config = FULL_CSV_DATASETS[dataset_name]
-    raw_root = Path(raw_root)
-    csv_path = raw_root / dataset_config["csv_path"]
-    if not csv_path.exists():
-        raise FileNotFoundError(f"Missing source CSV: {csv_path}")
-    default_lookback, default_horizon = get_dataset_lengths(dataset_name)
-    lookback_window = lookback_window or default_lookback
-    forecast_horizon = forecast_horizon or default_horizon
-
-    if variant == "raw":
-        records_df = base_builder.build_time_series_records(
-            csv_path,
-            data_source=dataset_name,
-            field=str(dataset_config["field"]),
-            lookback_window=lookback_window,
-            forecast_horizon=forecast_horizon,
-            stride=int(dataset_config["stride"]),
-        )
-        return base_builder.split_records_contiguously(records_df)
-
-    raw_records_df = base_builder.build_time_series_records(
-        csv_path,
-        data_source=dataset_name,
-        field=str(dataset_config["field"]),
-        lookback_window=lookback_window,
-        forecast_horizon=forecast_horizon,
-        stride=int(dataset_config["stride"]),
-    )
-    raw_public_split_frames = base_builder._split_dataframe_contiguously(raw_records_df)
-    records_df = build_internal_time_series_records(
-        csv_path,
-        data_source=dataset_name,
-        field=str(dataset_config["field"]),
-        lookback_window=lookback_window,
-        forecast_horizon=forecast_horizon,
-        stride=int(dataset_config["stride"]),
-    )
-    raw_split_frames = base_builder._split_dataframe_contiguously(records_df)
-    split_frames = build_train_only_banddrop_split_frames(
-        raw_split_frames,
-        variant=variant,
-        teacher_mse_fn=teacher_mse_fn
-        or _make_teacher_mse_fn(server_url, teacher_model_name, dataset_name)
-        if variant == "teacher_banddrop"
-        else None,
-        forecast_horizon=forecast_horizon,
+def _build_source_split_frames(source, *, dataset_name, field, stride, variant,
+                               teacher_mse_fn, server_url, teacher_model_name,
+                               lookback_window, forecast_horizon):
+    records = pd.DataFrame(base_builder._build_window_records(
+        source, data_source=dataset_name, field=field, stride=stride,
+        lookback_window=lookback_window, forecast_horizon=forecast_horizon,
+        include_internal_columns=True,
+    ))
+    if records.empty:
+        raise ValueError(f"No complete forecasting windows for {dataset_name}")
+    raw_splits = base_builder._split_dataframe_contiguously(records)
+    splits = build_train_only_banddrop_split_frames(
+        raw_splits, variant=variant, forecast_horizon=forecast_horizon,
+        teacher_mse_fn=teacher_mse_fn or _make_teacher_mse_fn(server_url, teacher_model_name, dataset_name),
         dataset_name=dataset_name,
     )
-    split_frames["val"] = raw_public_split_frames["val"]
-    split_frames["test"] = raw_public_split_frames["test"]
-    return base_builder.finalize_split_frames(split_frames)
+    if variant == "teacher_banddrop":
+        splits["train"] = splits["train"].sort_values(["band", "mse_rank", "entropy_rank"], kind="stable")
+    return base_builder.finalize_split_frames(splits)
+
+
+def build_full_csv_banddrop_split_frames(
+    dataset_name: str, *, raw_root=DEFAULT_DATASETS_RAW_ROOT, variant="teacher_banddrop",
+    teacher_mse_fn=None, server_url=base_builder.MODEL_SERVER_URL,
+    teacher_model_name=base_builder.TEACHER_MODEL_NAME,
+    lookback_window=None, forecast_horizon=None,
+):
+    dataset_name = dataset_name.upper()
+    config = FULL_CSV_DATASETS[dataset_name]
+    default_lookback, default_horizon = get_dataset_lengths(dataset_name)
+    source = Path(raw_root) / config["csv_path"]
+    if not source.exists():
+        raise FileNotFoundError(f"Missing source CSV: {source}")
+    return _build_source_split_frames(
+        source, dataset_name=dataset_name, field=config["field"], stride=config["stride"],
+        variant=variant, teacher_mse_fn=teacher_mse_fn, server_url=server_url,
+        teacher_model_name=teacher_model_name, lookback_window=lookback_window or default_lookback,
+        forecast_horizon=forecast_horizon or default_horizon,
+    )
 
 
 def build_presplit_banddrop_split_frames(
-    dataset_name: str,
-    *,
-    raw_root: str | Path = DEFAULT_DATASETS_RAW_ROOT,
-    variant: str = "banddrop",
-    teacher_mse_fn: TeacherMSEFn | None = None,
-    server_url: str = base_builder.MODEL_SERVER_URL,
-    teacher_model_name: str = base_builder.TEACHER_MODEL_NAME,
-    lookback_window: int | None = None,
-    forecast_horizon: int | None = None,
-) -> dict[str, pd.DataFrame]:
+    dataset_name: str, *, raw_root=DEFAULT_DATASETS_RAW_ROOT, variant="teacher_banddrop",
+    teacher_mse_fn=None, server_url=base_builder.MODEL_SERVER_URL,
+    teacher_model_name=base_builder.TEACHER_MODEL_NAME,
+    lookback_window=None, forecast_horizon=None,
+):
     dataset_name = dataset_name.upper()
-    if dataset_name not in PRESPLIT_CSV_DATASETS:
-        valid_names = ", ".join(PRESPLIT_CSV_DATASETS)
-        raise ValueError(f"Unknown presplit dataset '{dataset_name}'. Valid names: {valid_names}")
-
-    dataset_config = PRESPLIT_CSV_DATASETS[dataset_name]
+    config = PRESPLIT_CSV_DATASETS[dataset_name]
+    source_dir = Path(raw_root) / config["dir"]
+    full_path = source_dir / f"{config['prefix']}_full.csv"
+    if full_path.exists():
+        source = full_path
+    else:
+        # Reconstruct chronology instead of trusting older split proportions.
+        source = pd.concat([pd.read_csv(source_dir / f"{config['prefix']}_{name}.csv")
+                            for name in base_builder.SPLIT_NAMES], ignore_index=True)
+        source.columns = source.columns.str.strip()
+        source["date"] = pd.to_datetime(source["date"])
+        source = source.sort_values("date").drop_duplicates("date", keep="first")
     default_lookback, default_horizon = get_dataset_lengths(dataset_name)
-    lookback_window = lookback_window or default_lookback
-    forecast_horizon = forecast_horizon or default_horizon
-    split_frames = {}
-    for split_name in base_builder.SPLIT_NAMES:
-        csv_path = Path(raw_root) / str(dataset_config["dir"]) / f"{dataset_config['prefix']}_{split_name}.csv"
-        if not csv_path.exists():
-            raise FileNotFoundError(f"Missing source CSV: {csv_path}")
-
-        if variant == "raw" or split_name != "train":
-            split_frames[split_name] = base_builder.build_time_series_records(
-                csv_path,
-                data_source=dataset_name,
-                field=str(dataset_config["field"]),
-                lookback_window=lookback_window,
-                forecast_horizon=forecast_horizon,
-                stride=int(dataset_config["stride"]),
-            )
-        else:
-            raw_df = build_internal_time_series_records(
-                csv_path,
-                data_source=dataset_name,
-                field=str(dataset_config["field"]),
-                lookback_window=lookback_window,
-                forecast_horizon=forecast_horizon,
-                stride=int(dataset_config["stride"]),
-            )
-            if variant == "teacher_banddrop":
-                split_frames[split_name] = build_train_only_banddrop_split_frames(
-                    {"train": raw_df, "val": raw_df.iloc[0:0], "test": raw_df.iloc[0:0]},
-                    variant=variant,
-                    teacher_mse_fn=teacher_mse_fn
-                    or _make_teacher_mse_fn(server_url, teacher_model_name, dataset_name),
-                    forecast_horizon=forecast_horizon,
-                    dataset_name=dataset_name,
-                )["train"]
-            elif variant == "banddrop":
-                split_frames[split_name] = filter_entropy_banddrop_records(raw_df)
-            else:
-                raise ValueError("variant must be 'banddrop', 'teacher_banddrop', or 'raw'")
-
-    return base_builder.finalize_split_frames(split_frames)
+    return _build_source_split_frames(
+        source, dataset_name=dataset_name, field=config["field"], stride=config["stride"],
+        variant=variant, teacher_mse_fn=teacher_mse_fn, server_url=server_url,
+        teacher_model_name=teacher_model_name, lookback_window=lookback_window or default_lookback,
+        forecast_horizon=forecast_horizon or default_horizon,
+    )
 
 
 def build_dataset_split_frames(
@@ -546,20 +487,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Build ETT RL parquet datasets with the same base recipe as RL/ETTH1: "
-            "window the OT series, optionally drop band0, then split train/val/test as 7:1:2."
+            "window the OT series, optionally drop band0, split raw chronology as 6:2:2 (ETT), 7:1:2 (others), then filter training only."
         )
     )
     parser.add_argument("--datasets", default="all", help="Comma-separated ETT names, or 'all'.")
-    parser.add_argument("--variant", choices=["banddrop", "teacher_banddrop", "raw"], default="banddrop")
+    parser.add_argument("--variant", choices=["banddrop", "teacher_banddrop", "raw"], default="teacher_banddrop")
     parser.add_argument("--raw-root", type=Path, default=DEFAULT_DATASETS_RAW_ROOT)
     parser.add_argument("--raw-dir", type=Path, default=DEFAULT_RAW_DIR)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--server-url", default=base_builder.MODEL_SERVER_URL)
-    parser.add_argument("--teacher-model-name", default=base_builder.TEACHER_MODEL_NAME)
+    parser.add_argument("--reference-model", "--teacher-model-name", dest="teacher_model_name",
+                        default=base_builder.TEACHER_MODEL_NAME,
+                        help="Reference forecaster for curriculum difficulty; distinct from the trajectory teacher")
     parser.add_argument("--lookback-window", type=int, default=None)
     parser.add_argument("--forecast-horizon", type=int, default=None)
     args = parser.parse_args()
 
+    merged = {name: [] for name in base_builder.SPLIT_NAMES}
     for dataset_name in parse_dataset_names(args.datasets):
         output_paths = build_and_save_dataset(
             dataset_name,
@@ -574,6 +518,14 @@ def main() -> None:
         print(f"{dataset_name}: {_summarize_saved_paths(output_paths)}")
         for split_name, output_path in output_paths.items():
             print(f"  {split_name}: {output_path}")
+            merged[split_name].append(pd.read_parquet(output_path))
+    for name, parts in merged.items():
+        joint = pd.concat(parts, ignore_index=True)
+        if name == "train" and args.variant == "teacher_banddrop":
+            joint["_band"] = joint["extra_info"].map(lambda info: info["band"])
+            joint = joint.sort_values("_band", kind="stable").drop(columns="_band")
+        args.output_root.mkdir(parents=True, exist_ok=True)
+        joint.to_parquet(args.output_root / f"{name}.parquet", index=False)
 
 
 if __name__ == "__main__":

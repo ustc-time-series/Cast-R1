@@ -22,7 +22,6 @@ import torch
 import numpy as np
 from collections import defaultdict
 
-import verl.utils.torch_functional as verl_F
 
 def compute_gae_advantage_return(
     token_level_rewards: torch.Tensor,
@@ -54,6 +53,8 @@ def compute_gae_advantage_return(
             shape: (bs, response_length)
 
     """
+    import verl.utils.torch_functional as verl_F
+
     device = token_level_rewards.device
 
     with torch.no_grad():
@@ -104,6 +105,7 @@ def compute_grpo_outcome_advantage(
     trajectory_uids: np.ndarray,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
+    step_indices: np.ndarray | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute advantage for GRPO, operating only on Outcome reward
@@ -131,35 +133,49 @@ def compute_grpo_outcome_advantage(
         Returns: `(torch.Tensor)`
             shape is (bs, response_length)
     """
-    scores = token_level_rewards.sum(dim=-1)
-
-    request2score = {}
-    id2score = defaultdict(list)
-    id2mean = {}
-    id2std = {}
+    # Batch balancing can reorder turns. Select the terminal turn by its explicit
+    # step index, then broadcast ONE outcome advantage to every turn's policy tokens.
+    row_scores = token_level_rewards.sum(dim=-1)
+    if epsilon <= 0:
+        raise ValueError("GRPO requires a positive numerical stabilizer")
+    if step_indices is None:
+        if len(set(trajectory_uids)) != len(trajectory_uids):
+            raise ValueError("Multi-turn GRPO requires step_indices to locate terminal rewards")
+        step_indices = np.zeros(len(trajectory_uids), dtype=int)
+    if not (len(index) == len(trajectory_uids) == len(step_indices) == len(row_scores)):
+        raise ValueError("GRPO metadata must have one entry per response row")
 
     with torch.no_grad():
-        bsz = scores.shape[0]
+        terminal_rows = {}
+        trajectory_groups = {}
+        active_trajectories = {trajectory for row, trajectory in enumerate(trajectory_uids)
+                               if response_mask[row].any()}
+        for row, (trajectory, group, step) in enumerate(zip(trajectory_uids, index, step_indices)):
+            if trajectory not in active_trajectories:
+                continue
+            if trajectory in trajectory_groups and trajectory_groups[trajectory] != group:
+                raise ValueError("A trajectory cannot belong to multiple input groups")
+            trajectory_groups[trajectory] = group
+            previous = terminal_rows.get(trajectory)
+            if previous is None or step > step_indices[previous]:
+                terminal_rows[trajectory] = row
 
-        for i in range(bsz):
-            if trajectory_uids[i] not in request2score:
-                request2score[trajectory_uids[i]] = scores[i]
-                id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
-            elif len(id2score[idx]) > 1:
-                scores_tensor = torch.stack(id2score[idx])
-                id2mean[idx] = torch.mean(scores_tensor)
-                id2std[idx] = torch.std(scores_tensor)
-            else:
-                raise ValueError(f"no score in prompt index: {idx}")
-        for i in range(bsz):
+        groups = defaultdict(list)
+        for trajectory, row in terminal_rows.items():
+            groups[trajectory_groups[trajectory]].append(trajectory)
+        trajectory_advantages = {}
+        for trajectories in groups.values():
+            outcomes = torch.stack([row_scores[terminal_rows[t]] for t in trajectories])
+            mean = outcomes.mean()
+            std = outcomes.std() if len(trajectories) > 1 else outcomes.new_tensor(0.0)
+            centered = outcomes - mean
             if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-            else:
-                scores[i] = scores[i] - id2mean[index[i]]
-        scores = scores.unsqueeze(-1) * response_mask
+                centered = centered / (std + epsilon)
+            trajectory_advantages.update(zip(trajectories, centered))
 
-    return scores, scores
+        advantages = torch.zeros_like(row_scores)
+        for row, trajectory in enumerate(trajectory_uids):
+            if trajectory in trajectory_advantages:
+                advantages[row] = trajectory_advantages[trajectory]
+        advantages = advantages.unsqueeze(-1) * response_mask
+    return advantages, advantages

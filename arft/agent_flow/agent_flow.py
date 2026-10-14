@@ -30,9 +30,8 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
-from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
 from verl.experimental.agent_loop.utils import resolve_config_path
-from verl.experimental.reward import RewardLoopWorker
+from verl.experimental.reward_loop import RewardLoopWorker
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import hf_processor, hf_tokenizer
@@ -45,7 +44,7 @@ from verl.utils.rollout_trace import (
 )
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
-from verl.experimental.agent_loop.agent_loop import AsyncLLMServerManager
+from verl.workers.rollout.llm_server import LLMServerClient, GlobalRequestLoadBalancer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -133,7 +132,7 @@ class AgentFlowBase(ABC):
     def __init__(
         self,
         trainer_config: _DummyConfig,
-        server_manager: AsyncLLMServerManager,
+        server_manager: LLMServerClient,
         reward_manager_worker: RewardLoopWorker,
         tokenizer: AutoTokenizer,
         processor: AutoProcessor,
@@ -242,6 +241,9 @@ class AgentFlowBase(ABC):
         max_prompt_length = getattr(rollout_cfg, "prompt_length", None)
         if max_prompt_length is None or len(prompt_ids) <= max_prompt_length:
             return prompt_ids
+
+        if getattr(getattr(config, "data", None), "truncation", None) == "error":
+            raise ValueError(f"Memory-conditioned prompt exceeds {max_prompt_length} tokens; refusing to drop task inputs")
 
         logger.warning(
             "Prompt length %s exceeds rollout.prompt_length=%s; truncating left context",
@@ -449,6 +451,7 @@ class AgentFlowWorkerBase:
         config: DictConfig,
         server_handles: list[ray.actor.ActorHandle],
         reward_router_address: str = None,
+        load_balancer_handle=None,
     ):
         """Initialize agent flow manager.
 
@@ -460,7 +463,11 @@ class AgentFlowWorkerBase:
 
         # for recipe to change
         if not hasattr(self, "server_manager"):
-            self.server_manager = AsyncLLMServerManager(config, server_handles)
+            if load_balancer_handle is None:
+                load_balancer_handle = GlobalRequestLoadBalancer.remote(
+                    servers={str(i): handle for i, handle in enumerate(server_handles)}
+                )
+            self.server_manager = LLMServerClient(config, load_balancer_handle)
 
         self.reward_router_address = reward_router_address
 
@@ -574,6 +581,7 @@ class AgentFlowWorkerBase:
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            kwargs["is_validation"] = batch.meta_info.get("validate", False)
             tasks.append(
                 asyncio.create_task(
                     self._run_agent_flow(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
@@ -656,7 +664,9 @@ class AgentFlowWorkerBase:
                     # For each step, create a reward tensor of same shape as response_mask, fill last valid position with reward
                     reward_tensor = torch.zeros_like(step.response_mask, dtype=torch.float32)
                     valid_length = step.response_mask.sum().item()
-                    reward_tensor[0, valid_length - 1] = float(step.reward_score)
+                    # An empty final response still carries a terminal failure
+                    # outcome for credit assignment to earlier generated turns.
+                    reward_tensor[0, max(0, int(valid_length) - 1)] = float(step.reward_score)
                     reward_tensors.append(reward_tensor)
                 else:
                     reward_tensors.append(None)
@@ -813,7 +823,7 @@ class AgentFlowManager:
         self.reward_model_manager = None
         self.reward_router_address = None
         if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
-            from verl.experimental.reward import RewardModelManager
+            from verl.experimental.reward_loop import RewardModelManager
 
             # TODO (dyy): current rm is colocated with the legacy fsdp/megatron rm
             # future pr will depericate fsdp/megatron rm and init RewardModelManager in standalone mode
@@ -827,6 +837,9 @@ class AgentFlowManager:
             self.agent_flow_workers_class = AgentFlowWorker
 
         self._initialize_llm_servers()
+        self.load_balancer = GlobalRequestLoadBalancer.remote(
+            servers=dict(zip(self.server_addresses, self.server_handles, strict=True))
+        )
         self._init_agent_flow_workers()
 
         # Initially we're in sleep mode.
@@ -867,10 +880,12 @@ class AgentFlowManager:
         print(f"AgentFlowManager: {self.server_addresses}")
 
         # Update Prometheus configuration with server addresses
-        if rollout_config.prometheus.enable:
+        prometheus = getattr(rollout_config, "prometheus", None)
+        if prometheus is not None and prometheus.enable:
+            from verl.workers.rollout.llm_server import update_prometheus_config
             if rollout_config.disable_log_stats:
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
-            update_prometheus_config(rollout_config.prometheus, self.server_addresses)
+            update_prometheus_config(prometheus, self.server_addresses, rollout_config.name)
 
     def _init_agent_flow_workers(self):
         self.agent_flow_workers = []
@@ -886,7 +901,7 @@ class AgentFlowManager:
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id, soft=True
                     ),
-                ).remote(self.config, self.server_handles, self.reward_router_address)
+                ).remote(self.config, self.server_handles, self.reward_router_address, self.load_balancer)
             )
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:

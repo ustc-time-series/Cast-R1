@@ -1,14 +1,23 @@
 {
-    "model_name": "iTransformer",
-    "seq_len": 96,
-    "pred_len": 96,
-    "enc_in": 1,
-    "d_model": 128,
-    "n_heads": 8,
-    "e_layers": 2,
-    "d_ff": 128,
-    "dropout": 0.0,
-    "features": "S",
-    "target": "OT",
-    "description": "iTransformer model trained on ETTh1 dataset (Time-Series-Library). Non-stationary Transformer normalization built-in."
+  "model_name": "iTransformer",
+  "seq_len": 96,
+  "pred_len": 96,
+  "enc_in": 7,
+  "d_model": 128,
+  "n_heads": 8,
+  "e_layers": 2,
+  "d_ff": 128,
+  "dropout": 0.0,
+  "features": "MS",
+  "target": "OT",
+  "description": "ETT multivariate checkpoint configuration; train with matched chronological splits before serving.",
+  "input_columns": [
+    "OT",
+    "HUFL",
+    "HULL",
+    "MUFL",
+    "MULL",
+    "LUFL",
+    "LULL"
+  ]
 }

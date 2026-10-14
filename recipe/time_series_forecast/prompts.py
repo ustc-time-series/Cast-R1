@@ -17,7 +17,7 @@ PREDICT_MODEL_DESCRIPTIONS = {
     "patchtst": "Strong local patterns, long-range dependencies",
     "itransformer": "Cross-channel correlations",
     "arima": "Clear trends, stable seasonality",
-    "chronos2": "Default. Highly irregular data",
+    "chronos2": "Pretrained forecasting, irregular temporal patterns",
 }
 
 
@@ -67,7 +67,7 @@ def build_timeseries_system_prompt(
         )
         turn2_instruction = (
             f"After seeing feature results in \"Analysis History\", call `predict_time_series` "
-            f"with chosen model (prefer '{preferred}' unless features strongly suggest otherwise):\n"
+            f"with a model selected from the evidence in Analysis History:\n"
             f"{model_lines}"
         )
 
@@ -88,15 +88,15 @@ Call one or more feature extraction tools. Do NOT call predict_time_series yet.
 
 **Turn 3 - Final Output**:
 Treat the Model Predictions as a reference forecast, not ground truth. Do not treat the reference
-forecast as the final answer automatically. Check it against the extracted evidence and produce an
-independent final forecast. Apply at most one simple global offset or scale correction when the
-extracted evidence shows a clear systematic bias.
+forecast as the final answer automatically. Check it against recent observations, task context and
+the retained evidence, and refine its level, trend, seasonality or local events when justified.
+Negative wholesale electricity prices can be valid; do not revise them solely for being negative.
 
 ## Output Format (Turn 3 only)
 Your response MUST contain ONLY the two tags below, in this order, with no extra text before/between/after them.
-Keep <think> to at most 40 tokens. If no single systematic bias is clear, say that there is no
-justified global correction. Paste the actual predicted values inside <answer>.
-<think>[<=40 tokens: no justified global correction, or name one global correction]</think>
+Explain any evidence-based refinement in <think>. Keep the forecast unchanged when no correction
+is supported by the evidence. Paste the actual predicted values inside <answer>.
+<think>[diagnosis and evidence-based refinement]</think>
 <answer>
 2017-05-05 00:00:00 12.345
 ...
@@ -107,8 +107,7 @@ justified global correction. Paste the actual predicted values inside <answer>.
 - Turn 2: Call predict_time_series ONLY after features are extracted.
 - Turn 3: Output answer ONLY after predictions are available.
 - Do not emit a blind verbatim copy of the reference forecast by default.
-- Either keep the reference forecast nearly unchanged because no justified global correction exists,
-  or apply one global offset/scale backed by the extracted evidence.
+- Keep or refine the reference forecast using the retained evidence and forecast-origin context.
 - After Model Predictions appear, tool use is closed; never emit <tool_call> or <tools>.
 - Each <answer> row must contain a future timestamp and one finite plain decimal value.
 - Do NOT output anything outside <think> and <answer>. Missing <answer> tags is incorrect.
@@ -127,6 +126,8 @@ def build_predict_stage_instruction(
     )
     if len(allowed) == 1:
         return f"Call predict_time_series with model_name '{preferred}'."
+    if not preferred_predict_model:
+        return f"Call predict_time_series with a model selected from Analysis History: {', '.join(allowed)}."
     return (
         "Call predict_time_series with your chosen model "
         f"(prefer '{preferred}' unless features strongly suggest another allowed model: {', '.join(allowed)})."
@@ -168,7 +169,8 @@ def build_predict_timeseries_tool_schema(
         model_summary = "Models: " + ", ".join(
             f"'{model_name}' ({PREDICT_MODEL_DESCRIPTIONS[model_name]})" for model_name in allowed
         ) + "."
-        model_description = f"Model to use. Prefer '{preferred}' unless features strongly suggest another model."
+        model_description = (f"Prefer '{preferred}' when supported by the evidence." if preferred_predict_model
+                             else "Select a model using the diagnostic evidence in Analysis History.")
 
     return {
         "type": "function",

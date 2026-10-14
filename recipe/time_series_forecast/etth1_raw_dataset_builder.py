@@ -9,6 +9,9 @@ import numpy as np
 import pandas as pd
 import requests
 
+from recipe.time_series_forecast.forecast_task import ForecastTask
+from recipe.time_series_forecast.config_utils import LONG_FORECAST_DATASETS, SHORT_FORECAST_DATASETS
+
 
 LOOKBACK_WINDOW = 96
 FORECAST_HORIZON = 96
@@ -18,7 +21,7 @@ DATA_SOURCE = "ETTH1"
 AGENT_NAME = "time_series_forecast_agent"
 ABILITY = "TimeSeriesForecasting"
 SPLIT_NAMES = ("train", "val", "test")
-SPLIT_RATIOS = (7, 1, 2)
+SPLIT_RATIOS = (6, 2, 2)
 PHASE_NAMES = ("phase1", "phase2", "phase3")
 PHASE_SIZE_RATIOS = (1, 1, 1)
 PE_M = 3
@@ -49,7 +52,7 @@ TeacherMSEFn = Callable[[list[str], list[float], list[float], int], float]
 
 
 def _format_value(value: float) -> str:
-    return str(round(float(value), 3))
+    return repr(float(value))
 
 
 def _format_window(window_df: pd.DataFrame, field: str) -> str:
@@ -76,7 +79,8 @@ def _allocate_counts(total: int, ratios: tuple[int | float, ...]) -> list[int]:
 
 
 def _load_source_dataframe(csv_path: str | Path) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
+    df = csv_path.copy() if isinstance(csv_path, pd.DataFrame) else pd.read_csv(csv_path)
+    df.columns = df.columns.str.strip()
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d %H:%M:%S")
     return df
 
@@ -92,6 +96,10 @@ def _build_window_records(
     include_internal_columns: bool = False,
 ) -> list[dict]:
     df = _load_source_dataframe(csv_path)
+    covariate_columns = [name for name in df.select_dtypes(include="number").columns if name != field]
+    # Only dataset-provided forecast fields are treated as known in the future.
+    future_columns = [name for name in covariate_columns if "forecast" in name.lower()] if data_source.upper() in SHORT_FORECAST_DATASETS else []
+    text_columns = [name for name in df.columns if name.lower() in {"text", "context", "news", "text_context"}] if data_source.upper() in SHORT_FORECAST_DATASETS else []
 
     records = []
     source_index = 0
@@ -108,12 +116,23 @@ def _build_window_records(
         if content_df[field].isna().any() or ground_truth_df[field].isna().any():
             continue
 
+        task = ForecastTask(
+            timestamps=content_df["date"].tolist(), values=content_df[field].astype(float).tolist(),
+            horizon=forecast_horizon, dataset_name=data_source, target_name=field,
+            historical_covariates={name: content_df[name].astype(float).tolist() for name in covariate_columns},
+            future_covariates={name: ground_truth_df[name].astype(float).tolist() for name in future_columns},
+            text_context="\n".join(str(content_df.iloc[-1][name]) for name in text_columns if pd.notna(content_df.iloc[-1][name])),
+        )
+
         record = {
             "data_source": data_source,
             "agent_name": AGENT_NAME,
-            "prompt": [{"content": _format_window(content_df, field), "role": "user"}],
+            "prompt": [{"content": task.serialize(), "role": "user"}],
             "ability": ABILITY,
             "reward_model": {"ground_truth": _format_window(ground_truth_df, field), "style": "rule"},
+            "target_start_index": content_end,
+            "target_end_index": ground_truth_end,
+            "source_total_rows": total_rows,
         }
 
         if include_internal_columns:
@@ -164,12 +183,12 @@ def permutation_entropy(values: list[float], m: int = PE_M, tau: int = PE_TAU) -
     counts: dict[tuple[int, ...], int] = {}
     for idx in range(num_patterns):
         window = values_array[idx : idx + m * tau : tau]
-        pattern = tuple(np.argsort(window))
+        pattern = tuple(np.argsort(window, kind="stable"))
         counts[pattern] = counts.get(pattern, 0) + 1
 
     probs = np.array(list(counts.values()), dtype=float)
     probs /= probs.sum()
-    entropy = -np.sum(probs * np.log(probs + 1e-12))
+    entropy = -np.sum(probs * np.log(probs))
     return float(entropy / math.log(math.factorial(m)))
 
 
@@ -203,6 +222,8 @@ def get_teacher_mse(
                 raise ValueError(f"prediction length {len(prediction)} != ground_truth {len(ground_truth)}")
             prediction_array = np.asarray(prediction, dtype=float)
             ground_truth_array = np.asarray(ground_truth, dtype=float)
+            if not np.isfinite(prediction_array).all() or not np.isfinite(ground_truth_array).all():
+                raise ValueError("Reference forecasts and training targets must be finite")
             return float(np.mean((prediction_array - ground_truth_array) ** 2))
         except Exception as exc:  # pragma: no cover - exercised via runtime integration
             last_error = exc
@@ -291,8 +312,21 @@ def _split_dataframe_contiguously(
     records_df: pd.DataFrame,
     *,
     split_names: tuple[str, ...] = SPLIT_NAMES,
-    split_ratios: tuple[int, ...] = SPLIT_RATIOS,
+    split_ratios: tuple[int, ...] | None = None,
 ) -> dict[str, pd.DataFrame]:
+    if split_ratios is None:
+        dataset = str(records_df.iloc[0]["data_source"]).upper() if len(records_df) else DATA_SOURCE
+        split_ratios = (6, 2, 2) if dataset in LONG_FORECAST_DATASETS - {"WIND"} else (7, 1, 2)
+    if len(records_df) and "target_start_index" in records_df:
+        # Split raw chronology first. Windows whose target crosses a boundary
+        # are excluded; validation/test histories may contain already observed past.
+        bounds = np.cumsum(_allocate_counts(int(records_df.iloc[0]["source_total_rows"]), split_ratios))
+        frames, start = {}, 0
+        for name, end in zip(split_names, bounds, strict=True):
+            keep = (records_df["target_start_index"] >= start) & (records_df["target_end_index"] <= end)
+            frames[name] = records_df.loc[keep].copy().reset_index(drop=True)
+            start = end
+        return frames
     counts = _allocate_counts(len(records_df), split_ratios)
     split_frames: dict[str, pd.DataFrame] = {}
 
@@ -306,6 +340,10 @@ def _split_dataframe_contiguously(
 
 def _build_extra_info(row: pd.Series, split_name: str, index: int) -> dict:
     extra_info: dict[str, int | str] = {"index": index, "split": split_name}
+    extra_info["dataset_name"] = str(row["data_source"])
+    for name in ("target_start_index", "target_end_index", "source_total_rows"):
+        if name in row and pd.notna(row[name]):
+            extra_info[name] = int(row[name])
     if "band" in row and pd.notna(row["band"]):
         extra_info["band"] = int(row["band"])
     if "phase" in row and pd.notna(row["phase"]):
@@ -331,7 +369,7 @@ def split_records_contiguously(
     records_df: pd.DataFrame,
     *,
     split_names: tuple[str, ...] = SPLIT_NAMES,
-    split_ratios: tuple[int, ...] = SPLIT_RATIOS,
+    split_ratios: tuple[int, ...] | None = None,
 ) -> dict[str, pd.DataFrame]:
     return finalize_split_frames(
         _split_dataframe_contiguously(records_df, split_names=split_names, split_ratios=split_ratios)
@@ -367,6 +405,9 @@ def build_phase(
 
     adjusted_ratios = [ratio if is_available else 0.0 for ratio, is_available in zip(ratios, available, strict=False)]
     total_ratio = sum(adjusted_ratios)
+    if total_ratio == 0:
+        adjusted_ratios = [float(is_available) for is_available in available]
+        total_ratio = sum(adjusted_ratios)
     adjusted_ratios = [ratio / total_ratio for ratio in adjusted_ratios]
 
     band_sizes = _allocate_counts(phase_size, tuple(adjusted_ratios))
@@ -428,10 +469,13 @@ def build_and_save_banddrop_etth1_dataset(
     output_dir: str | Path = DEFAULT_BANDDROP_OUTPUT_DIR,
     teacher_mse_fn: TeacherMSEFn | None = None,
 ) -> dict[str, Path]:
-    annotated_df = build_annotated_time_series_records(csv_path, teacher_mse_fn=teacher_mse_fn)
-    filtered_df = filter_band0_records(annotated_df)
-    split_frames = split_records_contiguously(filtered_df)
-    return save_split_dataframes(split_frames, output_dir)
+    from recipe.time_series_forecast.ett_rl_dataset_builder import build_internal_time_series_records, build_train_only_banddrop_split_frames
+    records_df = build_internal_time_series_records(csv_path, data_source=DATA_SOURCE)
+    split_frames = build_train_only_banddrop_split_frames(
+        _split_dataframe_contiguously(records_df), variant="teacher_banddrop",
+        teacher_mse_fn=teacher_mse_fn, forecast_horizon=FORECAST_HORIZON, dataset_name=DATA_SOURCE,
+    )
+    return save_split_dataframes(finalize_split_frames(split_frames), output_dir)
 
 
 def build_and_save_curriculum_etth1_dataset(
@@ -441,9 +485,12 @@ def build_and_save_curriculum_etth1_dataset(
     teacher_mse_fn: TeacherMSEFn | None = None,
     rng_seed: int = RNG_SEED,
 ) -> dict[str, Path]:
-    annotated_df = build_annotated_time_series_records(csv_path, teacher_mse_fn=teacher_mse_fn)
-    filtered_df = filter_band0_records(annotated_df)
-    base_split_frames = _split_dataframe_contiguously(filtered_df)
+    from recipe.time_series_forecast.ett_rl_dataset_builder import build_internal_time_series_records, build_train_only_banddrop_split_frames
+    records_df = build_internal_time_series_records(csv_path, data_source=DATA_SOURCE)
+    base_split_frames = build_train_only_banddrop_split_frames(
+        _split_dataframe_contiguously(records_df), variant="teacher_banddrop",
+        teacher_mse_fn=teacher_mse_fn, forecast_horizon=FORECAST_HORIZON, dataset_name=DATA_SOURCE,
+    )
     split_frames = {
         "train": build_curriculum_train_df(base_split_frames["train"], rng_seed=rng_seed),
         "val": base_split_frames["val"],

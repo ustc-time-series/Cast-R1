@@ -5,7 +5,7 @@ from collections.abc import Iterator, Sized
 
 from omegaconf import DictConfig
 
-from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+from arft.samplers import AbstractCurriculumSampler
 
 
 DEFAULT_PHASE_STEPS = (4, 8, 8)

@@ -5,6 +5,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES_DIR = PROJECT_ROOT / "examples" / "time_series_forecast"
 PUBLIC_EXAMPLE_FILES = [
     "examples/time_series_forecast/run_inference_benchmark.sh",
+    "examples/time_series_forecast/run_paper_rl.sh",
+    "examples/time_series_forecast/run_paper_sft.sh",
     "examples/time_series_forecast/run_qwen3-4B.sh",
     "examples/time_series_forecast/train_small_models_from_rl.sh",
 ]

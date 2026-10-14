@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from typing import List, Optional, Tuple
+from recipe.time_series_forecast.forecast_task import NUMBER
 
 
 RAW_BASELINE_METRICS: dict[str, tuple[float, float]] = {
@@ -122,11 +123,10 @@ def compute_raw_relative_score(
     extra_info: Optional[dict] = None,
 ) -> float:
     """
-    Reward raw-scale improvement toward the published baseline and tool forecast.
+    Legacy experimental reward, retained for explicit historical ablations.
 
-    The old normalized/shape reward can give high scores to copied tool forecasts
-    whose raw MSE/MAE are still worse than the baseline. This score uses raw MSE/MAE
-    as the main objective and makes exact tool copies non-positive.
+    The paper profile and forecasting flow use compute_score instead. This legacy
+    function compares raw errors with fixed baselines and penalizes tool copies.
     """
     if solution_str is None:
         return -1.0
@@ -230,7 +230,7 @@ def extract_values_from_time_series_string(text: str) -> List[float]:
             continue
         
         # Pattern 1: timestamp format "2017-05-01 00:00:00 11.588"
-        match = re.search(r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+(-?\d+\.?\d*)', line)
+        match = re.search(rf'\d{{4}}-\d{{2}}-\d{{2}}\s+\d{{2}}:\d{{2}}:\d{{2}}\s+({NUMBER})$', line)
         if match:
             try:
                 values.append(float(match.group(1)))
@@ -239,7 +239,7 @@ def extract_values_from_time_series_string(text: str) -> List[float]:
                 pass
         
         # Pattern 2: table format "| 1 | 11.588 |"
-        match = re.search(r'\|\s*\d+\s*\|\s*(-?\d+\.?\d*)\s*\|', line)
+        match = re.search(rf'\|\s*\d+\s*\|\s*({NUMBER})\s*\|', line)
         if match:
             try:
                 values.append(float(match.group(1)))
@@ -248,7 +248,7 @@ def extract_values_from_time_series_string(text: str) -> List[float]:
                 pass
         
         # Pattern 3: just the last number on the line
-        match = re.search(r'(-?\d+\.?\d*)$', line)
+        match = re.search(rf'({NUMBER})$', line)
         if match:
             try:
                 values.append(float(match.group(1)))
@@ -351,7 +351,7 @@ def compute_mse_score(solution_str: str, ground_truth: str) -> float:
     - Apply length penalty: score * (pred_len / gt_len)
     
     Returns:
-        Score in range [0, 0.6]
+        Score in range [0, 0.7]
     """
     gt_values = extract_ground_truth_values(ground_truth)
     pred_values = extract_values_from_time_series_string(solution_str)
@@ -369,7 +369,8 @@ def compute_mse_score(solution_str: str, ground_truth: str) -> float:
         return 0.0
     
     # Normalize using ground truth's statistics (stable normalization)
-    norm_pred, norm_gt = normalize_for_reward(pred_values[:min_len], gt_values[:min_len])
+    norm_pred, norm_gt = normalize_for_reward(pred_values[:min_len], gt_values)
+    norm_gt = norm_gt[:min_len]
     
     # Calculate MSE on normalized values
     mse = mean_squared_error(norm_gt, norm_pred)
@@ -385,7 +386,7 @@ def compute_mse_score(solution_str: str, ground_truth: str) -> float:
     length_ratio = min(pred_len / gt_len, 1.0)
     score = score * length_ratio
     
-    return score * 0.6
+    return score * 0.7
 
 
 def compute_season_trend_score(solution_str: str, ground_truth: str) -> float:
@@ -413,18 +414,17 @@ def compute_season_trend_score(solution_str: str, ground_truth: str) -> float:
         return 0.0
     
     # Normalize using ground truth's statistics
-    norm_pred, norm_gt = normalize_for_reward(pred_values[:min_len], gt_values[:min_len])
+    norm_pred, norm_gt = normalize_for_reward(pred_values[:min_len], gt_values)
+    norm_gt = norm_gt[:min_len]
     
     # Calculate MSE for seasonal and trend components
     mse_season, mse_trend = mean_squared_error_season_trend(norm_gt, norm_pred)
     
-    # If decomposition failed, return 0 (not undeserved points)
-    if mse_season is None or mse_trend is None:
-        return 0.0
-    
-    # Transform to scores using log compression (consistent with compute_mse_score)
-    score_season = 1.0 / (1.0 + np.log1p(mse_season))
-    score_trend = 1.0 / (1.0 + np.log1p(mse_trend))
+    # Failed/non-finite decomposition contributes zero for the affected view.
+    # Large but finite policy outputs can overflow the float32 moving average;
+    # a NaN here must not contaminate the terminal reward and its entire group.
+    score_season = 1.0 / (1.0 + np.log1p(mse_season)) if mse_season is not None and np.isfinite(mse_season) else 0.0
+    score_trend = 1.0 / (1.0 + np.log1p(mse_trend)) if mse_trend is not None and np.isfinite(mse_trend) else 0.0
     
     # Apply length penalty if prediction is shorter
     length_ratio = min(len(pred_values) / len(gt_values), 1.0)
@@ -532,11 +532,13 @@ def compute_score(
     The score is composed of:
     1. Format score: -1.0 to 0.0 (penalty for wrong format)
     2. Length score: 0.0 to 0.1 (reward for correct output length)
-    3. MSE score: 0.0 to 0.6 (main prediction accuracy)
-    4. Change point score: 0.0 to 0.2 (correct local extrema) [DISABLED for ablation]
-    5. Season/Trend score: 0.0 to 0.2 (pattern matching) [DISABLED for ablation]
+    3. MSE score: 0.0 to 0.7 (main prediction accuracy)
+    4. Change point score: 0.0 to 0.2 (correct local extrema)
+    5. Season/Trend score: 0.0 to 0.2 (pattern matching)
     
-    Total possible range (with ablation): -1.0 to 0.7
+    Valid outputs score p * (0.1 + 0.7*q(pred) + 0.05*q(season)
+    + 0.15*q(trend) + 0.1*max_hit_rate + 0.1*min_hit_rate), in [0, 1.2].
+    Each component applies the length factor once. Missing tags return -1.
     
     Args:
         data_source: Source identifier (unused but kept for compatibility)
@@ -566,13 +568,13 @@ def compute_score(
     # 3. MSE score (main accuracy metric)
     score += compute_mse_score(solution_str, ground_truth)
     
-    # 4. Change point score [DISABLED for ablation experiment]
+    # 4. Local extrema alignment
     try:
         score += compute_change_point_score(solution_str, ground_truth)
     except Exception as e:
         print(f"[DEBUG] Error in compute_change_point_score: {e}")
     
-    # 5. Season/Trend decomposition score [DISABLED for ablation experiment]
+    # 5. Seasonal/trend decomposition
     try:
         score += compute_season_trend_score(solution_str, ground_truth)
     except Exception as e:

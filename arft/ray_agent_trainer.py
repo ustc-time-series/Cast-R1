@@ -38,7 +38,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+from arft.samplers import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -51,7 +51,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+from arft.rewards import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -117,6 +117,7 @@ def compute_advantage(
         valid_data = data.select_idxs(valid_mask)
     else:
         valid_data = data
+        valid_mask = slice(None)
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
@@ -141,6 +142,7 @@ def compute_advantage(
             index=valid_data.non_tensor_batch["uid"],
             trajectory_uids=valid_data.non_tensor_batch["trajectory_uids"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            step_indices=valid_data.non_tensor_batch["step_indices"],
         )
         advantages[valid_mask] = valid_advantages
         returns[valid_mask] = valid_returns
@@ -432,7 +434,8 @@ class RayAgentTrainer(RayPPOTrainer):
             # evaluate using reward_function
             if self.val_reward_fn is None:
                 raise ValueError("val_reward_fn must be provided for validation.")
-            result = self.val_reward_fn(test_batch, return_dict=True)
+            reward_tensor, extra = compute_reward(test_batch, self.val_reward_fn)
+            result = {"reward_tensor": reward_tensor, "reward_extra_info": extra}
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)

@@ -25,7 +25,7 @@ from hydra.core.plugins import Plugins
 from hydra.plugins.search_path_plugin import SearchPathPlugin
 from omegaconf import OmegaConf
 
-from verl.experimental.dataset.sampler import AbstractSampler
+from arft.samplers import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
@@ -50,6 +50,12 @@ class ArftSearchPathPlugin(SearchPathPlugin):
         
         # 添加 verl 配置路径作为基础配置（低优先级）
         verl_config_path = os.path.join(project_root, "verl", "verl", "trainer", "config")
+        if not os.path.isdir(verl_config_path):
+            import importlib.util
+            spec = importlib.util.find_spec("verl")
+            if spec is None or spec.origin is None:
+                raise ImportError("Install verl==0.8.0 or provide a local verl checkout")
+            verl_config_path = os.path.join(os.path.dirname(spec.origin), "trainer", "config")
         search_path.append(provider="verl", path=f"file://{verl_config_path}")
         
         # 添加 arft 配置路径作为覆盖配置（高优先级）

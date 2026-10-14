@@ -35,10 +35,11 @@ try:
 except Exception:
     _TORCH_NPU_IMPORTED = False
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 import uvicorn
 
 from recipe.time_series_forecast.config_utils import get_dataset_lengths, get_default_lengths
+from recipe.time_series_forecast.forecast_task import ForecastTask
 
 
 # =============================================================================
@@ -183,6 +184,16 @@ class PredictRequest(BaseModel):
     model_name: str = "chronos2"  # Model to use
     dataset_name: Optional[str] = None  # Dataset-specific checkpoint, e.g. ETTH1/WIND/NP
     data_source: Optional[str] = None   # Backward-compatible alias for dataset_name
+    target_name: str = "target"
+    historical_covariates: Dict[str, List[float]] = Field(default_factory=dict)
+    future_covariates: Dict[str, List[float]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_task(self):
+        ForecastTask(self.timestamps, self.values, self.prediction_length,
+                     target_name=self.target_name, historical_covariates=self.historical_covariates,
+                     future_covariates=self.future_covariates)
+        return self
 
 
 class PredictResponse(BaseModel):
@@ -353,8 +364,8 @@ class TSLNativeForecastWrapper(torch.nn.Module):
         self.pred_len = int(config.get("pred_len", DEFAULT_FORECAST_HORIZON))
         self.label_len = int(config.get("label_len", max(1, self.seq_len // 2)))
         self.freq = str(config.get("freq", "h"))
-        self.scaler_mean = float(config["scaler_mean"])
-        self.scaler_std = float(config["scaler_std"])
+        self.register_buffer("scaler_mean", torch.as_tensor(config["scaler_mean"], dtype=torch.float32))
+        self.register_buffer("scaler_std", torch.as_tensor(config["scaler_std"], dtype=torch.float32).clamp_min(1e-8))
 
     def _build_mark(self, timestamps: Optional[List[pd.Timestamp]], batch_size: int, length: int, device) -> torch.Tensor:
         if timestamps is None:
@@ -589,59 +600,26 @@ def load_all_models(device: str = "cuda"):
 # =============================================================================
 
 def predict_with_chronos2(request: PredictRequest) -> PredictResponse:
-    """
-    Generate predictions using Chronos2 with Non-stationary Transformer normalization.
-    Uses BaseChronosPipeline.predict_quantiles (same as Time-Series-Library).
-    """
     pipeline = _models["chronos2"]
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Chronos2 model not loaded")
-    
-    datetime_list = [pd.to_datetime(ts) for ts in request.timestamps]
-    values = np.array(request.values, dtype=np.float32)
-    
-    # Convert to tensor: [batch=1, seq_len, n_vars=1]
-    x_enc = torch.FloatTensor(values).unsqueeze(0).unsqueeze(-1)
-    
-    # Non-stationary Transformer Normalization
-    means = x_enc.mean(1, keepdim=True).detach()
-    x_enc = x_enc - means
-    stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
-    x_enc = x_enc / stdev
-    
-    # Reshape for Chronos: [batch, n_vars, seq_len]
-    x_enc = x_enc.permute(0, 2, 1)
-    
-    # Predict using predict_quantiles
-    quantiles, _ = pipeline.predict_quantiles(
-        x_enc.cpu().numpy(),
-        prediction_length=request.prediction_length,
-        quantile_levels=[0.1, 0.5, 0.9]
-    )
-    
-    # quantiles[0] shape: [batch, pred_len, num_quantiles]
-    # Take median (index 1 in last dimension)
-    dec_out = quantiles[0][:, :, 1]  # [batch, pred_len]
-    dec_out = dec_out.unsqueeze(-1)  # [batch, pred_len, 1]
-    
-    # De-Normalization
-    dec_out = dec_out * stdev[:, 0, :].unsqueeze(1).repeat(1, request.prediction_length, 1)
-    dec_out = dec_out + means[:, 0, :].unsqueeze(1).repeat(1, request.prediction_length, 1)
-    
-    pred_values = dec_out.numpy().squeeze().tolist()
-    
-    # Generate timestamps
-    freq = datetime_list[-1] - datetime_list[-2] if len(datetime_list) >= 2 else pd.Timedelta(hours=1)
-    last_ts = datetime_list[-1]
-    pred_timestamps = [(last_ts + freq * (i + 1)).strftime('%Y-%m-%d %H:%M:%S') 
-                       for i in range(request.prediction_length)]
-    
-    return PredictResponse(
-        timestamps=pred_timestamps,
-        values=pred_values,
-        model_used="chronos2",
-        status="success"
-    )
+    task = ForecastTask(request.timestamps, request.values, request.prediction_length,
+                        target_name=request.target_name,
+                        historical_covariates=request.historical_covariates,
+                        future_covariates=request.future_covariates)
+    history = pd.DataFrame({"id": request.series_id, "timestamp": pd.to_datetime(request.timestamps),
+                            "target": request.values, **request.historical_covariates})
+    future = None
+    if request.future_covariates:
+        future = pd.DataFrame({"id": request.series_id, "timestamp": pd.to_datetime(task.future_timestamps),
+                               **request.future_covariates})
+    result = pipeline.predict_df(history, future_df=future, id_column="id", target="target",
+                                 prediction_length=request.prediction_length, quantile_levels=[0.5])
+    values = result["0.5"].astype(float).tolist()
+    if len(values) != request.prediction_length or not np.isfinite(values).all():
+        raise ValueError("Chronos returned an incomplete or non-finite forecast")
+    return PredictResponse(timestamps=task.future_timestamps, values=values,
+                           model_used="chronos2", dataset_used=request.dataset_name)
 
 
 def predict_with_pytorch_model(request: PredictRequest, model_name: str) -> PredictResponse:
@@ -666,12 +644,22 @@ def predict_with_pytorch_model(request: PredictRequest, model_name: str) -> Pred
     device = next(model.parameters()).device
     
     # Prepare data
-    values = np.array(request.values, dtype=np.float32)
+    config = _configs.get(f"{model_name}:{_model_cache_key(dataset_name)}", _configs.get(model_name, {}))
+    columns = config.get("input_columns") or [request.target_name]
+    if request.historical_covariates and len(columns) == 1:
+        raise ValueError("This univariate checkpoint cannot use the paper's historical covariates; retrain a multivariate checkpoint")
+    supplied = {request.target_name: request.values, **request.historical_covariates}
+    if any(name not in supplied for name in columns):
+        raise ValueError(f"Checkpoint requires missing input columns: {columns}")
+    values = np.column_stack([supplied[name] for name in columns]).astype(np.float32)
+    if values.shape[1] != int(config.get("enc_in", 1)):
+        raise ValueError("Checkpoint channel count does not match supplied historical covariates")
+    target_index = columns.index(request.target_name)
     datetime_list = [pd.to_datetime(ts) for ts in request.timestamps]
     freq = datetime_list[-1] - datetime_list[-2] if len(datetime_list) >= 2 else pd.Timedelta(hours=1)
     
     # Prepare input tensor: [batch, seq_len, n_vars]
-    input_tensor = torch.FloatTensor(values).unsqueeze(0).unsqueeze(-1).to(device)
+    input_tensor = torch.FloatTensor(values).unsqueeze(0).to(device)
     
     # Predict. TSL-native models additionally need timestamps for timeF features
     # and handle the global TSL dataset scaler inside the wrapper.
@@ -686,14 +674,17 @@ def predict_with_pytorch_model(request: PredictRequest, model_name: str) -> Pred
             predictions = model(input_tensor)
     
     # Convert to numpy
-    pred_values = predictions.cpu().numpy().squeeze()
+    prediction_array = predictions.cpu().numpy()
+    if prediction_array.ndim != 3 or prediction_array.shape[0] != 1:
+        raise ValueError("Forecaster must return [batch, horizon, channels]")
+    output_index = target_index if prediction_array.shape[2] > 1 else 0
+    pred_values = prediction_array[0, :, output_index]
     
     # Ensure correct length
     if len(pred_values) > request.prediction_length:
         pred_values = pred_values[:request.prediction_length]
     elif len(pred_values) < request.prediction_length:
-        pad_len = request.prediction_length - len(pred_values)
-        pred_values = np.concatenate([pred_values, [pred_values[-1]] * pad_len])
+        raise ValueError("Checkpoint forecasting horizon is shorter than the requested task")
     
     # Generate timestamps
     last_ts = datetime_list[-1]

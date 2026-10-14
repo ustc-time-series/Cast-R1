@@ -1,0 +1,65 @@
+# Paper main experiment: one mixed-dataset, memory-conditioned Qwen3-8B policy.
+defaults:
+  - arft_ppo_trainer
+  - _self_
+
+data:
+  train_files: ${oc.env:CAST_R1_DATA_ROOT,datasets/PAPER_RL}/train.parquet
+  val_files: ${oc.env:CAST_R1_DATA_ROOT,datasets/PAPER_RL}/val.parquet
+  train_batch_size: 64
+  max_prompt_length: 8192
+  max_response_length: 4096
+  return_raw_chat: true
+  filter_overlong_prompts: true
+  truncation: error
+  shuffle: false
+  dataloader_num_workers: 0
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+
+custom_reward_function:
+  path: ${oc.env:CAST_R1_REWARD_PATH,recipe/time_series_forecast/reward.py}
+  name: compute_score
+
+actor_rollout_ref:
+  model:
+    path: ${oc.env:CAST_R1_SFT_MODEL,models/Cast-R1-SFT-8B}
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+  actor:
+    ppo_mini_batch_size: 64
+    ppo_micro_batch_size_per_gpu: 4
+    use_kl_loss: true
+    kl_loss_coef: 0.04
+    kl_loss_type: low_var_kl
+    optim:
+      lr: 1.0e-6
+      optimizer: AdamW
+      lr_scheduler_type: cosine
+  rollout:
+    name: vllm
+    n: 8
+    temperature: 1.0
+    tensor_model_parallel_size: 4
+    gpu_memory_utilization: 0.6
+    log_prob_micro_batch_size_per_gpu: 4
+    agent:
+      agent_flow_config_path: ${oc.env:CAST_R1_AGENT_CONFIG,recipe/time_series_forecast/base_paper.yaml}
+  ref:
+    log_prob_micro_batch_size_per_gpu: 4
+
+trainer:
+  n_gpus_per_node: 4
+  nnodes: 1
+  total_epochs: 1
+  total_training_steps: null
+  logger: [console]
+  project_name: Cast-R1
+  experiment_name: paper-qwen3-8b
+  val_before_train: true
+  save_freq: 1000
+  test_freq: 1000
+  device: cuda

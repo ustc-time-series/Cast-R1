@@ -1,0 +1,23 @@
+torch>=2.6
+numpy>=1.24,<2
+pandas>=2.0,<3
+datasets>=3,<4
+pyarrow>=14,<21
+scipy>=1.10
+statsmodels>=0.14
+scikit-learn>=1.3
+ruptures>=1.1
+pydantic>=2
+requests>=2.31
+httpx>=0.27
+fastapi>=0.110
+uvicorn>=0.27
+PyYAML>=6
+hydra-core>=1.3,<1.4
+omegaconf>=2.3,<2.4
+transformers>=4.51,<5
+accelerate>=1.2,<2
+chronos-forecasting>=2
+verl==0.8.0
+pytest>=8
+# Install a CUDA-compatible vLLM build separately on the training host.

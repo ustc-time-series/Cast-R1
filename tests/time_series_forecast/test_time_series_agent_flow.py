@@ -43,15 +43,16 @@ def test_compute_mse_mae_from_time_series_text_returns_nan_without_predictions()
     assert math.isnan(mae)
 
 
-def test_intermediate_reward_only_rewards_state_changing_tool_progress():
+def test_intermediate_tool_steps_have_no_auxiliary_reward():
     flow = TimeSeriesForecastAgentFlow.__new__(TimeSeriesForecastAgentFlow)
 
-    assert flow._compute_intermediate_tool_reward(model_progress_made=True) > 0.0
+    assert flow._compute_intermediate_tool_reward(model_progress_made=True) == 0.0
     assert flow._compute_intermediate_tool_reward(model_progress_made=False) == 0.0
 
 
 def test_repeated_feature_tool_can_trigger_auto_prediction_without_rewarding_model():
     flow = TimeSeriesForecastAgentFlow.__new__(TimeSeriesForecastAgentFlow)
+    flow.allow_tool_fallback = True
     flow.basic_statistics = {"mean": 1.0}
     flow.within_channel_dynamics = None
     flow.forecast_residuals = None
@@ -71,7 +72,7 @@ def test_max_steps_without_final_answer_penalizes_last_step():
 
     flow._apply_no_final_answer_penalty()
 
-    assert flow.steps[-1].reward_score == pytest.approx(-0.5)
+    assert flow.steps[-1].reward_score == pytest.approx(-1.0)
 
 
 def test_tool_schemas_follow_workflow_state():
@@ -244,11 +245,11 @@ def test_current_messages_append_fresh_user_prompt_after_prediction_tool_result(
 
     assert messages[-1]["role"] == "user"
     assert "### Model Predictions" in messages[-1]["content"]
-    assert "Output your final answer" in messages[-1]["content"]
-    assert "Do NOT output any text outside these tags." in messages[-1]["content"]
+    assert "<answer>" in messages[-1]["content"]
+    assert "Do not call tools." in messages[-1]["content"]
 
 
-def test_followup_turn2_prompt_truncates_repeated_historical_data():
+def test_forecasting_stage_retains_full_historical_window():
     flow = TimeSeriesForecastAgentFlow.__new__(TimeSeriesForecastAgentFlow)
     flow.time_series_data = "\n".join(
         [f"2020-01-01 {hour:02d}:00:00 {hour}.0" for hour in range(12)]
@@ -265,9 +266,9 @@ def test_followup_turn2_prompt_truncates_repeated_historical_data():
 
     prompt = flow._build_user_prompt()
 
-    assert "### Historical Data (truncated)" in prompt
-    assert "... (2 rows omitted) ..." in prompt
-    assert "### Historical Data\n2020-01-01 00:00:00 0.0" not in prompt
+    assert "### Historical Data (recent)" not in prompt
+    assert "2020-01-01 00:00:00" in prompt
+    assert "2020-01-01 11:00:00" in prompt
 
 
 def test_assistant_history_message_drops_long_reasoning_when_tool_calls_exist():
@@ -380,7 +381,7 @@ def test_policy_aware_initial_system_prompt_uses_preferred_predict_model():
     assert "prefer 'chronos2'" not in messages[0]["content"].lower()
 
 
-def test_final_reward_penalizes_exact_tool_copy_when_worse_than_baseline():
+def test_paper_reward_has_no_external_baseline_margin():
     flow = TimeSeriesForecastAgentFlow.__new__(TimeSeriesForecastAgentFlow)
     tool_prediction = "\n".join(
         [
@@ -398,10 +399,10 @@ def test_final_reward_penalizes_exact_tool_copy_when_worse_than_baseline():
 
     reward = flow._compute_final_reward(tool_prediction, ground_truth, dataset_name="ETTH2")
 
-    assert reward < 0.0
+    assert 0.0 <= reward <= 1.2
 
 
-def test_final_reward_penalizes_exact_tool_copy_when_reference_is_good_but_not_perfect():
+def test_paper_reward_has_no_tool_copy_penalty():
     flow = TimeSeriesForecastAgentFlow.__new__(TimeSeriesForecastAgentFlow)
     tool_prediction = "\n".join(
         [
@@ -419,7 +420,7 @@ def test_final_reward_penalizes_exact_tool_copy_when_reference_is_good_but_not_p
 
     reward = flow._compute_final_reward(tool_prediction, ground_truth, dataset_name="ETTH1")
 
-    assert reward < 0.0
+    assert 0.0 <= reward <= 1.2
 
 
 def test_final_reward_allows_exact_perfect_tool_copy_to_remain_non_negative():
@@ -438,7 +439,7 @@ def test_final_reward_allows_exact_perfect_tool_copy_to_remain_non_negative():
     assert reward >= 0.0
 
 
-def test_auto_finalize_prediction_scores_tool_forecast_against_raw_baseline():
+def test_refinement_ablation_uses_the_same_paper_reward():
     flow = TimeSeriesForecastAgentFlow.__new__(TimeSeriesForecastAgentFlow)
     tool_prediction = "\n".join(
         [
@@ -548,6 +549,7 @@ def test_predict_schema_can_be_restricted_to_allowed_models():
 def test_predict_tool_call_falls_back_to_allowed_preferred_model():
     async def run_call():
         flow = TimeSeriesForecastAgentFlow.__new__(TimeSeriesForecastAgentFlow)
+        flow.allow_tool_fallback = True
         flow.basic_statistics = {"mean": 1.0}
         flow.within_channel_dynamics = None
         flow.forecast_residuals = None
@@ -586,7 +588,7 @@ def test_run_salvages_malformed_initial_tool_markup_into_feature_stage_progress(
                 (102,): '<tool_call>{"name":"predict_time_series","arguments":{"model_name":"itransformer"}}</tool_call>',
                 (103,): (
                     "<think>no justified global correction</think><answer>\n"
-                    "2020-01-02 00:00:00 1.5\n"
+                    "2020-01-01 02:00:00 1.5\n"
                     "</answer>"
                 ),
             }
@@ -616,6 +618,7 @@ def test_run_salvages_malformed_initial_tool_markup_into_feature_stage_progress(
 
     async def run_flow():
         flow = TimeSeriesForecastAgentFlow.__new__(TimeSeriesForecastAgentFlow)
+        flow.allow_tool_fallback = True
         flow.config = SimpleNamespace(
             actor_rollout_ref=SimpleNamespace(
                 rollout=SimpleNamespace(prompt_length=64, response_length=32),
@@ -659,7 +662,7 @@ def test_run_salvages_malformed_initial_tool_markup_into_feature_stage_progress(
                 flow.history_analysis.append("Basic Statistics:\n  Mean: 1.0")
                 return
             if tool_call.name == "predict_time_series":
-                flow.prediction_results = "2020-01-02 00:00:00 1.5"
+                flow.prediction_results = "2020-01-01 02:00:00 1.5"
                 return
             raise AssertionError(f"unexpected tool call: {tool_call.name}")
 
@@ -694,7 +697,7 @@ def test_run_salvages_malformed_initial_tool_markup_into_feature_stage_progress(
                     "content": "2020-01-01 00:00:00 1.0\n2020-01-01 01:00:00 1.1",
                 }
             ],
-            reward_model={"ground_truth": "2020-01-02 00:00:00 1.5"},
+            reward_model={"ground_truth": "2020-01-01 02:00:00 1.5"},
             data_source="ETTH2",
         )
 
@@ -702,8 +705,8 @@ def test_run_salvages_malformed_initial_tool_markup_into_feature_stage_progress(
 
     step2_prompt = output.steps[1].extra_fields["raw_prompt"]
 
-    assert [message["role"] for message in step2_prompt] == ["system", "user", "assistant", "user"]
-    assert step2_prompt[2]["content"] == malformed_tool_call
+    assert [message["role"] for message in step2_prompt] == ["system", "user"]
+    assert malformed_tool_call not in str(step2_prompt)
     assert "Basic Statistics:" in step2_prompt[-1]["content"]
     assert "No previous analysis performed." not in step2_prompt[-1]["content"]
     assert "Call predict_time_series" in step2_prompt[-1]["content"]
@@ -721,7 +724,7 @@ def test_run_refreshes_user_prompt_between_feature_prediction_and_final_answer_t
                 (102,): '<tool_call>{"name":"predict_time_series","arguments":{"model_name":"itransformer"}}</tool_call>',
                 (103,): (
                     "<think>no justified global correction</think><answer>\n"
-                    "2020-01-02 00:00:00 1.5\n"
+                    "2020-01-01 02:00:00 1.5\n"
                     "</answer>"
                 ),
             }
@@ -795,7 +798,7 @@ def test_run_refreshes_user_prompt_between_feature_prediction_and_final_answer_t
                 flow._append_message("tool", flow.history_analysis[-1])
                 return
             if tool_call.name == "predict_time_series":
-                flow.prediction_results = "2020-01-02 00:00:00 1.5"
+                flow.prediction_results = "2020-01-01 02:00:00 1.5"
                 flow._append_message("tool", flow._format_prediction_results())
                 return
             raise AssertionError(f"unexpected tool call: {tool_call.name}")
@@ -840,22 +843,13 @@ def test_run_refreshes_user_prompt_between_feature_prediction_and_final_answer_t
     step2_prompt = output.steps[1].extra_fields["raw_prompt"]
     step3_prompt = output.steps[2].extra_fields["raw_prompt"]
 
-    assert [message["role"] for message in step2_prompt] == ["system", "user", "assistant", "tool", "user"]
+    assert [message["role"] for message in step2_prompt] == ["system", "user"]
     assert "### Analysis History" in step2_prompt[-1]["content"]
     assert "Call predict_time_series" in step2_prompt[-1]["content"]
     assert "Model Predictions" in step2_prompt[-1]["content"]
     assert "No predictions available yet." in step2_prompt[-1]["content"]
 
-    assert [message["role"] for message in step3_prompt] == [
-        "system",
-        "user",
-        "assistant",
-        "tool",
-        "user",
-        "assistant",
-        "tool",
-        "user",
-    ]
+    assert [message["role"] for message in step3_prompt] == ["system", "user"]
     assert "### Model Predictions" in step3_prompt[-1]["content"]
-    assert "Output your final answer" in step3_prompt[-1]["content"]
-    assert "Do NOT output any text outside these tags." in step3_prompt[-1]["content"]
+    assert "<answer>" in step3_prompt[-1]["content"]
+    assert "Do not call tools." in step3_prompt[-1]["content"]
