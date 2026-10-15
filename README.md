@@ -331,19 +331,6 @@ Full reproduction requires original benchmark inputs/context, matching tool weig
 
 ## Citation
 
-**Revised manuscript used by this implementation**
-
-The following entry uses the title and authors from the current manuscript:
-
-```bibtex
-@misc{tao2026castr1revised,
-  title = {Learning Agentic Time Series Forecasting via Trajectory Distillation and Memory-Based Reinforcement Learning},
-  author = {Tao, Xiaoyu and Cheng, Mingyue and Liu, Yaguo and Gao, Xingpeng and Wen, Qingsong and Liu, Qi and Wang, Shijin and Chen, Enhong},
-  year = {2026},
-  note = {Revised manuscript}
-}
-```
-
 **Public arXiv preprint**
 
 For the [public preprint](https://arxiv.org/abs/2602.13802), use its published metadata. It currently has an earlier title and author list:
