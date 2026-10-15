@@ -176,6 +176,10 @@ The evaluator reports completion counts and failure rates. If any episode fails,
 
 ## Datasets & Models
 
+**Dataset download:** [Google Drive](https://drive.google.com/file/d/1LUyyjsGenIsbGoJ5O3pBRSpTMH4fBkq_/view?usp=drive_link).
+
+Follow the expected local CSV paths below and the [Reproduction](#reproduction) instructions to prepare the data.
+
 ### Dataset sources
 
 | Dataset | Official source | Expected local CSV |
