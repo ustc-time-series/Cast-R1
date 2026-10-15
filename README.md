@@ -10,7 +10,6 @@
   </p>
 </div>
 
-This implementation follows the revised manuscript named above. The [public arXiv record](https://arxiv.org/abs/2602.13802) currently retains the earlier title and author list; version-specific references are provided in [Citation](#citation).
 
 **Contents:** [Overview](#overview) · [News](#news) · [Framework](#framework) · [Installation](#installation) · [Quick Start](#quick-start) · [Experiments](#experiments) · [Datasets & Models](#datasets--models) · [Reproduction](#reproduction) · [Citation](#citation) · [Acknowledgements](#acknowledgements) · [License & Contact](#license--contact)
 
