@@ -3,6 +3,7 @@
   <p><strong>Learning Agentic Time Series Forecasting via Trajectory Distillation and Memory-Based Reinforcement Learning</strong></p>
   <p>
     <a href="https://arxiv.org/abs/2602.13802">Public Preprint</a> ·
+    <a href="https://ustc-time-series.github.io/Cast-R1/"><strong>Project Page</strong></a> ·
     <a href="https://github.com/ustc-time-series/Cast-R1">Code</a> ·
     <a href="#quick-start">Quick Start</a> ·
     <a href="#citation">Citation</a>
