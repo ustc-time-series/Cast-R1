@@ -2,7 +2,7 @@
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-const colors = { history: '#64766d', initial: '#8299ad', refined: '#3e855f', target: '#c67d56' };
+const colors = { history: '#727e93', initial: '#a1adca', refined: '#3c6ff0', target: '#c67d56' };
 let research;
 let episodeStep = 0;
 let replayTimer;
@@ -35,16 +35,16 @@ function renderHeroChart() {
   const x = v => m.l + v / 192 * (W - m.l - m.r);
   const y = v => H - m.b - (v - 7) / 8.6 * (H - m.t - m.b);
   const cut = x(96);
-  let out = `<title>Paper ETTh1 case: observed history and Cast-R1 forecast</title><rect x="${cut}" y="${m.t - 10}" width="${W - m.r - cut}" height="${H - m.t - m.b + 10}" fill="#dce8cc" opacity=".42" rx="3"/>`;
-  for (let i = 0; i < 4; i++) out += `<line x1="0" x2="${W}" y1="${y(8 + i * 2)}" y2="${y(8 + i * 2)}" stroke="#ced8c5" stroke-width=".6" stroke-dasharray="2 4"/>`;
-  out += `<line x1="${cut}" x2="${cut}" y1="${m.t - 10}" y2="${H - m.b}" stroke="#acbca2" stroke-dasharray="3 4" stroke-width=".8"/>`;
-  out += svgText(5, 10, 'OBSERVED HISTORY', 'font-size="7" fill="#93a086" letter-spacing="1"');
-  out += svgText(cut + 12, 10, 'FORECAST', 'font-size="7" fill="#6a875c" letter-spacing="1"');
+  let out = `<title>Paper ETTh1 case: observed history and Cast-R1 forecast</title><rect x="${cut}" y="${m.t - 10}" width="${W - m.r - cut}" height="${H - m.t - m.b + 10}" fill="#e0eaff" opacity=".42" rx="3"/>`;
+  for (let i = 0; i < 4; i++) out += `<line x1="0" x2="${W}" y1="${y(8 + i * 2)}" y2="${y(8 + i * 2)}" stroke="#d9e2f4" stroke-width=".6" stroke-dasharray="2 4"/>`;
+  out += `<line x1="${cut}" x2="${cut}" y1="${m.t - 10}" y2="${H - m.b}" stroke="#a3abbb" stroke-dasharray="3 4" stroke-width=".8"/>`;
+  out += svgText(5, 10, 'OBSERVED HISTORY', 'font-size="7" fill="#838da3" letter-spacing="1"');
+  out += svgText(cut + 12, 10, 'FORECAST', 'font-size="7" fill="#606b83" letter-spacing="1"');
   out += polyline(research.case.target.filter(p => p[0] < 96), x, y, colors.history, 1.55);
   out += polyline(research.case.refined, x, y, colors.refined, 1.85);
-  out += svgText(5, H - 4, '−96 h', 'font-size="8" fill="#95a28b"');
-  out += svgText(cut, H - 4, 'Forecast origin', 'font-size="8" fill="#8a9c7e" text-anchor="middle"');
-  out += svgText(W - 6, H - 4, '+96 h', 'font-size="8" fill="#95a28b" text-anchor="end"');
+  out += svgText(5, H - 4, '−96 h', 'font-size="8" fill="#8791a6"');
+  out += svgText(cut, H - 4, 'Forecast origin', 'font-size="8" fill="#7c879e" text-anchor="middle"');
+  out += svgText(W - 6, H - 4, '+96 h', 'font-size="8" fill="#8791a6" text-anchor="end"');
   svg.innerHTML = out;
 }
 
@@ -58,23 +58,23 @@ function renderEpisodeChart() {
   const y = v => H - m.b - (v - 7) / 8.4 * (H - m.t - m.b);
   const cut = x(95.5);
   let out = `<title>${steps[episodeStep].title}</title><desc>Figure-based replay of 96 historical hours and a 96-hour forecasting horizon. ${steps[episodeStep].description}</desc>`;
-  out += `<rect x="${cut}" y="${m.t - 10}" width="${W - m.r - cut}" height="${H - m.t - m.b + 10}" rx="3" fill="#edf2e5"/>`;
+  out += `<rect x="${cut}" y="${m.t - 10}" width="${W - m.r - cut}" height="${H - m.t - m.b + 10}" rx="3" fill="#eff4ff"/>`;
   [7, 9, 11, 13, 15].forEach(v => {
-    out += `<line x1="${m.l}" x2="${W - m.r}" y1="${y(v)}" y2="${y(v)}" stroke="#dfe5d7" stroke-width=".65"/>`;
-    out += svgText(m.l - 8, y(v) + 3, v, 'text-anchor="end" fill="#95a18d" font-size="8"');
+    out += `<line x1="${m.l}" x2="${W - m.r}" y1="${y(v)}" y2="${y(v)}" stroke="#e4eaf5" stroke-width=".65"/>`;
+    out += svgText(m.l - 8, y(v) + 3, v, 'text-anchor="end" fill="#8791a7" font-size="8"');
   });
   [0, 48, 96, 144, 192].forEach(v => {
-    out += svgText(x(v), H - 14, v, 'text-anchor="middle" fill="#95a18d" font-size="8"');
+    out += svgText(x(v), H - 14, v, 'text-anchor="middle" fill="#8791a7" font-size="8"');
   });
-  out += `<line x1="${cut}" x2="${cut}" y1="${m.t - 10}" y2="${H - m.b}" stroke="#b1bfa4" stroke-dasharray="3 4" stroke-width=".8"/>`;
-  out += svgText(m.l + 2, 12, 'OBSERVED · 96 h', 'font-size="7" fill="#92a087" letter-spacing=".5"');
-  out += svgText(cut + 10, 12, 'FORECAST · 96 h', 'font-size="7" fill="#78926b" letter-spacing=".5"');
-  if (episodeStep === 0) out += svgText(cut + (W - m.r - cut) / 2, H / 2, 'Awaiting forecast', 'text-anchor="middle" font-size="10" fill="#a1af96"');
+  out += `<line x1="${cut}" x2="${cut}" y1="${m.t - 10}" y2="${H - m.b}" stroke="#a6adbd" stroke-dasharray="3 4" stroke-width=".8"/>`;
+  out += svgText(m.l + 2, 12, 'OBSERVED · 96 h', 'font-size="7" fill="#838ea4" letter-spacing=".5"');
+  out += svgText(cut + 10, 12, 'FORECAST · 96 h', 'font-size="7" fill="#6c7891" letter-spacing=".5"');
+  if (episodeStep === 0) out += svgText(cut + (W - m.r - cut) / 2, H / 2, 'Awaiting forecast', 'text-anchor="middle" font-size="10" fill="#959db0"');
   if (episodeStep >= 3) out += polyline(research.case.target.filter(p => p[0] >= 95), x, y, colors.target, 1.35, '3 3');
   out += polyline(research.case.target.filter(p => p[0] < 96), x, y, colors.history, 1.55);
   if (episodeStep >= 1) out += polyline(research.case.initial, x, y, colors.initial, 1.5, '4 3');
   if (episodeStep >= 2) out += polyline(research.case.refined, x, y, colors.refined, 1.9);
-  out += svgText(W - 11, H - 1, 'Hour', 'font-size="7" fill="#a1ae97" text-anchor="end"');
+  out += svgText(W - 11, H - 1, 'Hour', 'font-size="7" fill="#959db0" text-anchor="end"');
   svg.innerHTML = out;
   svg.setAttribute('aria-label', `Step ${episodeStep + 1}: ${steps[episodeStep].title}`);
   ['initial', 'refined', 'target'].forEach((name, i) => {
