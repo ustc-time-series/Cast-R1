@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+  <title id="title">Cast-R1</title>
+  <desc id="desc">A historical time series connected to a forecast through structured memory.</desc>
+  <rect x="2" y="2" width="92" height="92" rx="23" fill="#102b4e"/>
+  <path d="M17 68H79M20 69V28" fill="none" stroke="#6986a6" stroke-width="3" stroke-linecap="round"/>
+  <path d="M22 58L33 44L43 51L54 32" fill="none" stroke="#67dfc4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M54 32L65 40L77 22" fill="none" stroke="#f7c66c" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5 6"/>
+  <circle cx="22" cy="58" r="3" fill="#67dfc4"/>
+  <rect x="48" y="26" width="12" height="12" rx="3" fill="#e9f5ff"/>
+  <circle cx="77" cy="22" r="3" fill="#f7c66c"/>
+</svg>
