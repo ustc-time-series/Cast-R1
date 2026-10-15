@@ -2,7 +2,6 @@
   <img src="assets/cast-r1-logo.svg" width="76" alt="Cast-R1 logo">
   <h1>Cast-R1</h1>
   <p><strong>Learning Agentic Time Series Forecasting via Trajectory Distillation and Memory-Based Reinforcement Learning</strong></p>
-  <p>Xiaoyu Tao · Mingyue Cheng · Yaguo Liu · Xingpeng Gao<br>Qingsong Wen · Qi Liu · Shijin Wang · Enhong Chen</p>
   <p>
     <a href="https://arxiv.org/abs/2602.13802">Public Preprint</a> ·
     <a href="https://github.com/ustc-time-series/Cast-R1">Code</a> ·
